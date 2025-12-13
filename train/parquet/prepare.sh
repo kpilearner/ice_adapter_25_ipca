@@ -1,0 +1,155 @@
+#!/bin/bash
+
+mkdir -p $(dirname "$0")
+
+BASE_URL_105="https://huggingface.co/datasets/sayakpaul/OmniEdit-mini/resolve/main/data"
+BASE_URL_571="https://huggingface.co/datasets/TIGER-Lab/OmniEdit-Filtered-1.2M/resolve/main/data"
+
+FILES=(
+    "train-00053-of-00105.parquet"
+    "train-00008-of-00105.parquet"
+    "train-00093-of-00105.parquet"
+    "train-00097-of-00105.parquet"
+    "train-00009-of-00105.parquet"
+    "train-00069-of-00105.parquet"
+    "train-00029-of-00105.parquet"
+    "train-00083-of-00105.parquet"
+    "train-00037-of-00105.parquet"
+    "train-00079-of-00105.parquet"
+    "train-00085-of-00105.parquet"
+    "train-00087-of-00105.parquet"
+    "train-00038-of-00105.parquet"
+    "train-00041-of-00105.parquet"
+    "train-00047-of-00105.parquet"
+    "train-00145-of-00571.parquet"
+    "train-00091-of-00105.parquet"
+    "train-00004-of-00105.parquet"
+    "train-00014-of-00105.parquet"
+    "train-00016-of-00105.parquet"
+    "train-00035-of-00105.parquet"
+    "train-00017-of-00105.parquet"
+    "train-00066-of-00105.parquet"
+    "train-00071-of-00105.parquet"
+    "train-00043-of-00105.parquet"
+    "train-00067-of-00105.parquet"
+    "train-00074-of-00105.parquet"
+    "train-00001-of-00105.parquet"
+    "train-00115-of-00571.parquet"
+    "train-00048-of-00105.parquet"
+    "train-00064-of-00105.parquet"
+    "train-00010-of-00105.parquet"
+    "train-00011-of-00105.parquet"
+    "train-00062-of-00105.parquet"
+    "train-00567-of-00571.parquet"
+    "train-00032-of-00105.parquet"
+    "train-00070-of-00105.parquet"
+    "train-00160-of-00571.parquet"
+    "train-00046-of-00105.parquet"
+    "train-00073-of-00105.parquet"
+    "train-00006-of-00105.parquet"
+    "train-00061-of-00105.parquet"
+    "train-00050-of-00105.parquet"
+    "train-00056-of-00105.parquet"
+    "train-00003-of-00105.parquet"
+    "train-00012-of-00105.parquet"
+    "train-00089-of-00105.parquet"
+    "train-00028-of-00105.parquet"
+    "train-00015-of-00105.parquet"
+    "train-00103-of-00105.parquet"
+    "train-00099-of-00105.parquet"
+    "train-00020-of-00105.parquet"
+    "train-00033-of-00105.parquet"
+    "train-00078-of-00105.parquet"
+    "train-00000-of-00105.parquet"
+    "train-00566-of-00571.parquet"
+    "train-00054-of-00105.parquet"
+    "train-00044-of-00105.parquet"
+    "train-00100-of-00571.parquet"
+    "train-00049-of-00105.parquet"
+    "train-00019-of-00105.parquet"
+    "train-00076-of-00105.parquet"
+    "train-00025-of-00105.parquet"
+    "train-00081-of-00105.parquet"
+    "train-00045-of-00105.parquet"
+    "train-00036-of-00105.parquet"
+    "train-00080-of-00105.parquet"
+    "train-00034-of-00105.parquet"
+    "train-00057-of-00105.parquet"
+    "train-00082-of-00105.parquet"
+    "train-00059-of-00105.parquet"
+    "train-00058-of-00105.parquet"
+    "train-00013-of-00105.parquet"
+    "train-00084-of-00105.parquet"
+    "train-00100-of-00105.parquet"
+    "train-00090-of-00105.parquet"
+    "train-00094-of-00105.parquet"
+    "train-00060-of-00105.parquet"
+    "train-00175-of-00571.parquet"
+    "train-00065-of-00105.parquet"
+    "train-00040-of-00105.parquet"
+    "train-00023-of-00105.parquet"
+    "train-00088-of-00105.parquet"
+    "train-00068-of-00105.parquet"
+    "train-00027-of-00105.parquet"
+    "train-00568-of-00571.parquet"
+    "train-00098-of-00105.parquet"
+    "train-00031-of-00105.parquet"
+    "train-00063-of-00105.parquet"
+    "train-00002-of-00105.parquet"
+    "train-00007-of-00105.parquet"
+    "train-00569-of-00571.parquet"
+    "train-00052-of-00105.parquet"
+    "train-00102-of-00105.parquet"
+    "train-00104-of-00105.parquet"
+    "train-00072-of-00105.parquet"
+    "train-00051-of-00105.parquet"
+    "train-00101-of-00105.parquet"
+    "train-00570-of-00571.parquet"
+    "train-00095-of-00105.parquet"
+    "train-00092-of-00105.parquet"
+    "train-00030-of-00105.parquet"
+    "train-00055-of-00105.parquet"
+    "train-00042-of-00105.parquet"
+    "train-00018-of-00105.parquet"
+    "train-00096-of-00105.parquet"
+    "train-00005-of-00105.parquet"
+    "train-00022-of-00105.parquet"
+    "train-00086-of-00105.parquet"
+    "train-00024-of-00105.parquet"
+    "train-00077-of-00105.parquet"
+    "train-00075-of-00105.parquet"
+    "train-00039-of-00105.parquet"
+    "train-00021-of-00105.parquet"
+    "train-00130-of-00571.parquet"
+    "train-00026-of-00105.parquet"
+    "train-00000-of-00571.parquet"
+)
+
+TOTAL=${#FILES[@]}
+CURRENT=0
+
+for file in "${FILES[@]}"; do
+    CURRENT=$((CURRENT+1))
+    echo "[$CURRENT/$TOTAL] $file"
+    
+    if [[ $file == *"-of-00105.parquet" ]]; then
+        BASE_URL=$BASE_URL_105
+    else
+        BASE_URL=$BASE_URL_571
+    fi
+    
+    wget -c "$BASE_URL/$file" -O "$file" || {
+        echo "Download $file failed, trying to continue..."
+    }
+    
+    if [ -f "$file" ]; then
+        filesize=$(du -h "$file" | cut -f1)
+        echo "Downloaded : $file ($filesize)"
+    else
+        echo "Warning: $file failed!"
+    fi
+    
+    echo "------------------------------------"
+done
+
+echo "All files downloaded!"

@@ -1,0 +1,12 @@
+accelerate
+diffusers==0.33.0
+gradio
+numpy
+peft
+protobuf
+sentencepiece
+spaces
+torch==2.7.0
+torchvision
+transformers==4.51.3
+gguf

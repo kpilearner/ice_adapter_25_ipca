@@ -1,0 +1,14 @@
+diffusers==0.32.0
+datasets==3.6.0
+transformers
+peft
+opencv-python
+protobuf
+sentencepiece
+gradio
+jupyter
+torchao
+lightning
+torchvision
+prodigyopt
+wandb
