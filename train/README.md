@@ -69,6 +69,16 @@ Then run:
 bash train/train/script/train.sh paired_csv_lora.yaml 41353
 ```
 
+### Using trained adapters at inference
+
+If you train with `train.adapter.enabled: true`, checkpoints saved by the training callback also include:
+
+- `prompt_adapter.pt` (pooled MLP adapter, if enabled)
+- `text_token_adapter.pt` (token adapter, if enabled)
+- `adapter_config.json`
+
+You can load them in inference scripts via `--adapter-dir /path/to/ckpt_dir`.
+
 
 
 ## MoE-LoRA Training

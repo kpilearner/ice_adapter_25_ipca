@@ -36,7 +36,10 @@ train:
     use_masked_loss: true
     masked_weight: 1.0
     unmasked_weight: 0.0
-    t_sampling: "uniform"
+    sigma_schedule: "flux_shifted_1000"
+    schedule_steps: 1000
+    t_weighting: "flux_gaussian"
+    loss_dtype: "float32"
 
   # Optional "instruction via adapter" path (trainable MLP on pooled prompt embedding).
   adapter:
@@ -52,7 +55,8 @@ train:
     r: 32
     lora_alpha: 32
     init_lora_weights: "gaussian"
-    target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
+    # Also patch context/text projection layers (Kontext-like): add_{q,k,v}_proj and to_add_out.
+    target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_k_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_q_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_v_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_add_out|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
 
   optimizer:
     type: "AdamW"

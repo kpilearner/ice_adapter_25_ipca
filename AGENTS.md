@@ -1,39 +1,36 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
+This repo is split between inference utilities and a nested training repo.
 
-- `scripts/`: Primary entrypoints for inference and demos (`inference.py`, `gradio_demo.py`, and MoE variants).
-- `assets/`: Small sample images for smoke-testing (`assets/girl.png`, etc.).
-- `docs/images/`: Documentation images referenced by `README.md`.
-- `train/`: Training-related notes and a separate dependency set (`train/README.md`, `train/requirements.txt`).
-- `requirements.txt`: Runtime/inference dependencies for the main scripts.
+- `scripts/`: Inference and tooling (`inference.py`, `inference_folder.py`, `gradio_demo.py`, `make_paired_csv.py`).
+- `run_inference.sh`, `run_inference_folder.sh`: Example launchers that wire paths, prompts, and output locations.
+- `train/`: Training code and assets.
+  - `train/src/`: Core training modules (`train/`, `flux/`).
+  - `train/train/config/`: YAML configs (e.g., `normal_lora.yaml`, `paired_csv_lora.yaml`).
+  - `train/train/script/`: Training entrypoints (`train.sh`, `train_moe.sh`).
+  - `train/parquet/`: Dataset preparation scripts and data storage.
+  - `train/assets/`: Sample assets and references.
 
 ## Build, Test, and Development Commands
-
-- Install (inference): `pip install -r requirements.txt`
-- Run single-image inference:
-  - `python scripts/inference.py --image assets/girl.png --instruction "Make her hair dark green." --seed 42`
-  - Use local weights: add `--flux-path /path/to/flux.1-fill-dev --lora-path /path/to/ICEdit-normal-LoRA`
-- Run Gradio demo: `python scripts/gradio_demo.py --port 7860`
-- MoE variants: `python scripts/inference_moe.py ...` and `python scripts/gradio_demo_moe.py ...`
+- `pip install -r requirements.txt` installs inference/demo dependencies.
+- `./run_inference.sh` runs single-image inference after you set `FLUX_PATH`, `LORA_PATH`, and `ADAPTER_DIR` in the script.
+- `./run_inference_folder.sh` runs batch inference for a folder; adjust `INPUT_DIR`, `OUTPUT_DIR`, and sizes.
+- `python scripts/gradio_demo.py --port 7860` launches the Gradio UI demo.
+- `python scripts/make_paired_csv.py --vis-dir data/vis --ir-dir data/ir --out train/parquet/metadata.csv --base-path train` builds paired CSV metadata.
+- `pip install -r train/requirements.txt` installs training dependencies.
+- `bash train/train/script/train.sh` trains using `train/train/config/normal_lora.yaml`.
+- `bash train/train/script/train.sh paired_csv_lora.yaml 41353` runs paired CSV training.
+- `bash train/parquet/prepare.sh` fetches/organizes parquet datasets.
 
 ## Coding Style & Naming Conventions
-
-- Language: Python (recommended: 3.10 to match `README.md`).
-- Indentation: 4 spaces; prefer explicit imports and small, readable functions.
-- Naming: `snake_case` for variables/functions, `PascalCase` for classes, and CLI flags in `kebab-case` (via `argparse`).
-- Keep CLI arguments backward compatible; prefer adding new flags over changing defaults.
+- Python: 4-space indentation, `snake_case` for functions/vars, `UpperCamelCase` for classes.
+- CLI flags use `--kebab-case` as shown in `scripts/`.
+- Configs live under `train/train/config/` and use descriptive suffixes like `*_lora.yaml`.
+- Shell scripts follow `set -euo pipefail` and keep paths configurable at the top.
 
 ## Testing Guidelines
-
-- No dedicated automated test suite in this repo. Do a quick smoke check by running `scripts/inference.py` on an image in `assets/`.
-- Reproducibility: set `--seed`. Many scripts assume input width `512` (they may auto-resize).
+No automated test suite is checked in. Validate changes by running inference on a small sample or a short training run. If you add tests, place them in a `tests/` or `train/tests/` directory and document the run command.
 
 ## Commit & Pull Request Guidelines
-
-- Commit messages in history are short and imperative (e.g., “update readme”, “release training code”), sometimes bilingual; follow the same style.
-- PRs should include: what changed, how it was validated (exact command), and any user-facing screenshots (e.g., Gradio UI or before/after results) when applicable.
-
-## Security & Configuration Tips
-
-- Do not commit model weights, datasets, or generated outputs. Use `--flux-path`/`--lora-path` for local checkpoints and add large artifacts to `.gitignore` if needed.
+Git history is minimal with simple messages like “first commit” and “Initial commit of forked ICDEdit project.” Keep commit messages short, sentence-case, and action-oriented (e.g., “Add paired CSV helper”). PRs should describe the goal, list commands run, and call out config or dataset changes. Avoid committing large model weights; reference local paths instead.

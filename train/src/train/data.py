@@ -106,13 +106,20 @@ class PairedCSVDataset(Dataset):
         target_size: int = 512,
         drop_text_prob: float = 0.0,
         return_pil_image: bool = False,
+        debug: bool = False,
         source_key: str = "kontext_images",
         target_key: str = "image",
         prompt_key: str = "prompt",
         default_prompt: str = "",
+        instruction_text: str | None = None,
+        caption_key: str | None = None,
+        caption_prefix: str = "",
+        default_caption: str = "",
         prompt_prefix: str = (
             "A diptych with two side-by-side images of the same scene. "
-            "On the right, the scene is exactly the same as on the left but "
+            "The left image is visible light. "
+            "The right image is the corresponding infrared thermal image. "
+            "Instruction: "
         ),
     ):
         self.base_path = base_path
@@ -121,14 +128,41 @@ class PairedCSVDataset(Dataset):
         self.target_size = target_size
         self.drop_text_prob = drop_text_prob
         self.return_pil_image = return_pil_image
+        self.debug = debug
         self.source_key = source_key
         self.target_key = target_key
         self.prompt_key = prompt_key
         self.default_prompt = default_prompt
+        self.instruction_text = instruction_text
+        self.caption_key = caption_key
+        self.caption_prefix = caption_prefix
+        self.default_caption = default_caption
         self.prompt_prefix = prompt_prefix
 
         self.to_tensor = T.ToTensor()
         self.rows = self._read_rows()
+        if self.debug:
+            head = self.rows[0]
+            print("[PairedCSVDataset] Loaded", len(self.rows), "rows from", self.metadata_path)
+            print("[PairedCSVDataset] base_path:", self.base_path)
+            print(
+                "[PairedCSVDataset] columns:",
+                list(head.keys()),
+                "source_key:",
+                self.source_key,
+                "target_key:",
+                self.target_key,
+                "prompt_key:",
+                self.prompt_key,
+            )
+            print(
+                "[PairedCSVDataset] sample row:",
+                {
+                    self.source_key: head.get(self.source_key),
+                    self.target_key: head.get(self.target_key),
+                    self.prompt_key: head.get(self.prompt_key) if self.prompt_key else None,
+                },
+            )
 
     def _read_rows(self):
         with open(self.metadata_path, "r", newline="", encoding="utf-8") as f:
@@ -168,13 +202,25 @@ class PairedCSVDataset(Dataset):
         tgt = tgt.resize((self.target_size, self.target_size)).convert("RGB")
 
         prompt = ""
-        if self.prompt_key:
-            prompt = row.get(self.prompt_key, "") or ""
-        if not prompt:
-            prompt = self.default_prompt
-        prompt = self.prompt_prefix + prompt
-        if random.random() < self.drop_text_prob:
-            prompt = " "
+        if self.instruction_text:
+            prompt = self.instruction_text
+        else:
+            if self.prompt_key:
+                prompt = row.get(self.prompt_key, "") or ""
+            if not prompt:
+                prompt = self.default_prompt
+            prompt = self.prompt_prefix + prompt
+            if random.random() < self.drop_text_prob:
+                prompt = " "
+
+        caption = None
+        if self.caption_key:
+            caption = row.get(self.caption_key, "") or ""
+            if not caption:
+                caption = self.default_caption
+            caption = f"{self.caption_prefix}{caption}"
+            if random.random() < self.drop_text_prob:
+                caption = " "
 
         combined_image = Image.new("RGB", (self.condition_size * 2, self.condition_size))
         combined_image.paste(src, (0, 0))
@@ -187,7 +233,7 @@ class PairedCSVDataset(Dataset):
             fill=255,
         )
 
-        return {
+        sample = {
             "image": self.to_tensor(combined_image),
             "condition": self.to_tensor(mask),
             "condition_type": "edit",
@@ -195,6 +241,9 @@ class PairedCSVDataset(Dataset):
             "position_delta": np.array([0, 0]),
             **({"pil_image": [tgt, combined_image]} if self.return_pil_image else {}),
         }
+        if caption is not None:
+            sample["caption"] = caption
+        return sample
 
 class OminiDataset(Dataset):
     def __init__(

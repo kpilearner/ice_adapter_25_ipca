@@ -18,29 +18,23 @@ train:
   save_path: "runs"
 
   dataset:
-    # Kontext-like local training format: a CSV that points to image pairs + prompt.
-    # Default column names match DiffSynth's Kontext example:
-    # - `kontext_images`: source/context image (e.g., visible)
-    # - `image`: target image (e.g., infrared)
-    # - `prompt`: instruction (can be constant across rows)
     type: "paired_csv"
     base_path: "/root/autodl-tmp/MSRS"
     metadata_path: "/root/autodl-tmp/MSRS/metadata.csv"
     source_key: "kontext_images"
     target_key: "image"
-    prompt_key: "prompt"
-    prompt_prefix: "A diptych with two side-by-side images of the same scene. The left image is visible light. The right image is the corresponding infrared thermal image. Instruction: "
-    default_prompt: "Transform the visible image into its infrared thermal counterpart while preserving scene structure and objects."
+    instruction_text: "A diptych with two side-by-side images of the same scene. The left image is visible light. The right image is the corresponding infrared thermal image. Instruction: Transform the visible image into its infrared thermal counterpart while preserving scene structure and objects."
+    caption_key: "prompt"
+    caption_prefix: ""
+    default_caption: ""
     condition_size: 512
     target_size: 512
     drop_text_prob: 0.0
-    # debug: true
 
   loss:
     use_masked_loss: true
     masked_weight: 1.0
     unmasked_weight: 0.0
-    # Kontext-like flow-matching schedule + weighting.
     sigma_schedule: "flux_shifted_1000"
     schedule_steps: 1000
     t_weighting: "flux_gaussian"
@@ -48,13 +42,19 @@ train:
 
   adapter:
     enabled: true
-    # "tokens" injects extra context tokens (IP/T2I-adapter-like conditioning via attention).
+    trainable: true
+    affect_prompt: false
     kind: "tokens"
     pooled_dim: 768
     num_tokens: 8
     token_hidden_dim: 1536
-    # token_dim can be omitted; it will be inferred from prompt_embeds at runtime.
     scale: 1.0
+    thermal:
+      enabled: true
+      num_tokens: 4
+      dim: 768
+      scale: 1.0
+      init_std: 0.02
 
   debug:
     enabled: false
@@ -63,7 +63,6 @@ train:
     r: 128
     lora_alpha: 128
     init_lora_weights: "gaussian"
-    # Also patch context/text projection layers (Kontext-like): add_{q,k,v}_proj and to_add_out.
     target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_k_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_q_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_v_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_add_out|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
 
   optimizer:

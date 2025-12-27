@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# usage: ./train.sh [CONFIG_FILE] [PORT]
-# example: ./train.sh paired_csv_lora.yaml 41353
+# usage: ./train_caption_gate_headwise.sh [CONFIG_FILE] [PORT]
+# example: ./train_caption_gate_headwise.sh paired_csv_lora_caption_gate_headwise.yaml 41353
 
 set -euo pipefail
 
-CONFIG_FILE="${1:-paired_csv_lora.yaml}"
+CONFIG_FILE="${1:-paired_csv_lora_caption_gate_headwise.yaml}"
 PORT="${2:-41353}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ if [ ! -d "${TRAIN_ROOT}/src" ]; then
   exit 1
 fi
 
-CONFIG_DIR="${TRAIN_ROOT}/train/config"                    # <repo>/train/train/config
+CONFIG_DIR="${TRAIN_ROOT}/train/config"
 CONFIG_PATH="${CONFIG_DIR}/${CONFIG_FILE}"
 
 export XFL_CONFIG="${CONFIG_PATH}"

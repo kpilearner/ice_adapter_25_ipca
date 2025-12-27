@@ -55,6 +55,12 @@ train:
     token_hidden_dim: 1536
     # token_dim can be omitted; it will be inferred from prompt_embeds at runtime.
     scale: 1.0
+    thermal:
+      enabled: true
+      num_tokens: 4
+      dim: 768
+      scale: 1.0
+      init_std: 0.02
 
   debug:
     enabled: false

@@ -75,6 +75,8 @@ def main():
         config['use_offset_noise'] = False
 
     # Initialize dataset and dataloader
+    debug_cfg = training_config.get("debug", {}) or {}
+    debug_enabled = bool(debug_cfg.get("enabled", False))
     
     if training_config["dataset"]["type"] == "edit":
         dataset = load_dataset('osunlp/MagicBrush')
@@ -113,10 +115,15 @@ def main():
             target_size=ds_cfg.get("target_size", 512),
             drop_text_prob=ds_cfg.get("drop_text_prob", 0.0),
             return_pil_image=ds_cfg.get("return_pil_image", False),
+            debug=bool(ds_cfg.get("debug", False)) or debug_enabled,
             source_key=ds_cfg.get("source_key", "kontext_images"),
             target_key=ds_cfg.get("target_key", "image"),
             prompt_key=ds_cfg.get("prompt_key", "prompt"),
             default_prompt=ds_cfg.get("default_prompt", ""),
+            instruction_text=ds_cfg.get("instruction_text"),
+            caption_key=ds_cfg.get("caption_key"),
+            caption_prefix=ds_cfg.get("caption_prefix", ""),
+            default_caption=ds_cfg.get("default_caption", ""),
             prompt_prefix=ds_cfg.get(
                 "prompt_prefix",
                 "A diptych with two side-by-side images of the same scene. "
@@ -142,6 +149,7 @@ def main():
         optimizer_config=training_config["optimizer"],
         loss_config=training_config.get("loss", None),
         adapter_config=training_config.get("adapter", None),
+        debug_config=debug_cfg,
         model_config=config.get("model", {}),
         gradient_checkpointing=training_config.get("gradient_checkpointing", False),
         use_offset_noise=config["use_offset_noise"],

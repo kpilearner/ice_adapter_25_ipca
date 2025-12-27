@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# usage: ./train.sh [CONFIG_FILE] [PORT]
-# example: ./train.sh paired_csv_lora.yaml 41353
+# usage: ./train_thermal_gate_global.sh [CONFIG_FILE] [PORT]
+# example: ./train_thermal_gate_global.sh paired_csv_lora_thermal_gate_global.yaml 41353
 
 set -euo pipefail
 
-CONFIG_FILE="${1:-paired_csv_lora.yaml}"
+CONFIG_FILE="${1:-paired_csv_lora_thermal_gate_global.yaml}"
 PORT="${2:-41353}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -65,7 +65,7 @@ class TrainingCallback(L.Callback):
             )
 
         # Save LoRA weights at specified intervals
-        if self.total_steps % self.save_interval == 0:
+        if self.save_interval and self.save_interval > 0 and self.total_steps % self.save_interval == 0:
             print(
                 f"Epoch: {trainer.current_epoch}, Steps: {self.total_steps} - Saving LoRA weights"
             )
@@ -74,7 +74,7 @@ class TrainingCallback(L.Callback):
             )
 
         # Generate and save a sample image at specified intervals
-        if self.total_steps % self.sample_interval == 0:
+        if self.sample_interval and self.sample_interval > 0 and self.total_steps % self.sample_interval == 0:
             print(
                 f"Epoch: {trainer.current_epoch}, Steps: {self.total_steps} - Generating a sample"
             )
