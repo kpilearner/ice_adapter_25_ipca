@@ -4,11 +4,59 @@ from diffusers.models.attention_processor import Attention, F
 from .lora_controller import enable_lora
 
 
+class AdapterCrossAttention(torch.nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        scale_init: float = 0.0,
+        trainable_scale: bool = True,
+    ):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError("AdapterCrossAttention: dim must be divisible by heads.")
+        self.dim = int(dim)
+        self.heads = int(heads)
+        self.head_dim = self.dim // self.heads
+        if trainable_scale:
+            self.scale = torch.nn.Parameter(torch.tensor(float(scale_init)))
+        else:
+            self.register_buffer("scale", torch.tensor(float(scale_init)), persistent=False)
+
+        self.to_q = torch.nn.Linear(self.dim, self.dim, bias=False)
+        self.to_k = torch.nn.Linear(self.dim, self.dim, bias=False)
+        self.to_v = torch.nn.Linear(self.dim, self.dim, bias=False)
+        self.to_out = torch.nn.Linear(self.dim, self.dim, bias=False)
+        self.kv_proj = torch.nn.LazyLinear(self.dim)
+
+    def forward(self, hidden_states: torch.Tensor, adapter_tokens: torch.Tensor) -> torch.Tensor:
+        if adapter_tokens is None:
+            return torch.zeros_like(hidden_states)
+
+        if adapter_tokens.shape[-1] != self.dim:
+            adapter_tokens = self.kv_proj(adapter_tokens)
+
+        q = self.to_q(hidden_states)
+        k = self.to_k(adapter_tokens)
+        v = self.to_v(adapter_tokens)
+
+        bsz = q.shape[0]
+        q = q.view(bsz, -1, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, -1, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, -1, self.heads, self.head_dim).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(bsz, -1, self.dim)
+        out = self.to_out(out)
+        return out * self.scale
+
+
 def attn_forward(
     attn: Attention,
     hidden_states: torch.FloatTensor,
     encoder_hidden_states: torch.FloatTensor = None,
     condition_latents: torch.FloatTensor = None,
+    adapter_tokens: torch.FloatTensor = None,
     attention_mask: Optional[torch.FloatTensor] = None,
     image_rotary_emb: Optional[torch.Tensor] = None,
     cond_rotary_emb: Optional[torch.Tensor] = None,
@@ -175,6 +223,7 @@ def block_forward(
     hidden_states: torch.FloatTensor,
     encoder_hidden_states: torch.FloatTensor,
     condition_latents: torch.FloatTensor,
+    adapter_tokens: torch.FloatTensor,
     temb: torch.FloatTensor,
     cond_temb: torch.FloatTensor,
     cond_rotary_emb=None,
@@ -207,6 +256,7 @@ def block_forward(
         hidden_states=norm_hidden_states,
         encoder_hidden_states=norm_encoder_hidden_states,
         condition_latents=norm_condition_latents if use_cond else None,
+        adapter_tokens=adapter_tokens,
         image_rotary_emb=image_rotary_emb,
         cond_rotary_emb=cond_rotary_emb if use_cond else None,
     )
@@ -217,6 +267,12 @@ def block_forward(
     # 1. hidden_states
     attn_output = gate_msa.unsqueeze(1) * attn_output
     hidden_states = hidden_states + attn_output
+    if adapter_tokens is not None and hasattr(self, "adapter_ca"):
+        adapter_tokens = adapter_tokens.to(
+            device=norm_hidden_states.device, dtype=norm_hidden_states.dtype
+        )
+        adapter_out = self.adapter_ca(norm_hidden_states, adapter_tokens)
+        hidden_states = hidden_states + adapter_out
     # 2. encoder_hidden_states
     context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
     encoder_hidden_states = encoder_hidden_states + context_attn_output

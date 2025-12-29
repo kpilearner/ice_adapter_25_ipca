@@ -5,6 +5,8 @@ import argparse
 import hashlib
 import json
 import os
+import sys
+import types
 from pathlib import Path
 from typing import Iterable
 
@@ -12,6 +14,13 @@ import torch
 from diffusers import FluxFillPipeline
 from PIL import Image
 import numpy as np
+
+TRAIN_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "train"))
+if TRAIN_ROOT not in sys.path:
+    sys.path.insert(0, TRAIN_ROOT)
+
+from src.flux.transformer import tranformer_forward
+from src.flux.block import AdapterCrossAttention
 
 
 DEFAULT_PROMPT_PREFIX = (
@@ -174,6 +183,194 @@ class ThermalGate(torch.nn.Module):
         return torch.sigmoid(self.net(pooled))
 
 
+class ThermalQueryGenerator(torch.nn.Module):
+    def __init__(
+        self,
+        query_dim: int,
+        output_dim: int,
+        num_queries: int = 4,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        ffn_dim: int = 1024,
+        scale: float = 1.0,
+        init_std: float = 0.02,
+        use_type_embed: bool = True,
+    ):
+        super().__init__()
+        if num_queries <= 0:
+            raise ValueError("num_queries must be > 0")
+        if query_dim % num_heads != 0:
+            raise ValueError("query_dim must be divisible by num_heads")
+        self.query_dim = int(query_dim)
+        self.output_dim = int(output_dim)
+        self.num_queries = int(num_queries)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.ffn_dim = int(ffn_dim)
+        self.scale = float(scale)
+        self.init_std = float(init_std)
+        self.use_type_embed = bool(use_type_embed)
+
+        self.query_embed = torch.nn.Parameter(torch.randn(self.num_queries, self.query_dim) * self.init_std)
+        self.caption_proj = torch.nn.LazyLinear(self.query_dim)
+        self.image_proj = torch.nn.LazyLinear(self.query_dim)
+
+        if self.use_type_embed:
+            self.caption_type = torch.nn.Parameter(torch.zeros(1, 1, self.query_dim))
+            self.image_type = torch.nn.Parameter(torch.zeros(1, 1, self.query_dim))
+        else:
+            self.caption_type = None
+            self.image_type = None
+
+        self.cross_attn_layers = torch.nn.ModuleList(
+            [
+                torch.nn.MultiheadAttention(self.query_dim, self.num_heads, batch_first=True)
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.self_attn_layers = torch.nn.ModuleList(
+            [
+                torch.nn.MultiheadAttention(self.query_dim, self.num_heads, batch_first=True)
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.ffn_layers = torch.nn.ModuleList(
+            [
+                torch.nn.Sequential(
+                    torch.nn.Linear(self.query_dim, self.ffn_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.ffn_dim, self.query_dim),
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.norm1 = torch.nn.ModuleList([torch.nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+        self.norm2 = torch.nn.ModuleList([torch.nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+        self.norm3 = torch.nn.ModuleList([torch.nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+
+        self.out_proj = None
+        if self.output_dim != self.query_dim:
+            self.out_proj = torch.nn.Linear(self.query_dim, self.output_dim)
+
+    def ensure_output_dim(self, target_dim: int, device: torch.device, dtype: torch.dtype) -> None:
+        if int(target_dim) == self.output_dim:
+            return
+        self.out_proj = torch.nn.Linear(self.query_dim, int(target_dim)).to(device=device, dtype=dtype)
+        self.output_dim = int(target_dim)
+
+    def forward(
+        self,
+        image_tokens: torch.Tensor | None = None,
+        caption_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if image_tokens is None and caption_tokens is None:
+            raise ValueError("Either image_tokens or caption_tokens must be provided.")
+
+        memory = []
+        if caption_tokens is not None:
+            cap = self.caption_proj(caption_tokens)
+            if self.caption_type is not None:
+                cap = cap + self.caption_type
+            memory.append(cap)
+        if image_tokens is not None:
+            img = self.image_proj(image_tokens)
+            if self.image_type is not None:
+                img = img + self.image_type
+            memory.append(img)
+        memory = torch.cat(memory, dim=1)
+
+        query = self.query_embed.unsqueeze(0).expand(memory.shape[0], -1, -1)
+        for i in range(self.num_layers):
+            attn_out, _ = self.cross_attn_layers[i](query, memory, memory, need_weights=False)
+            query = self.norm1[i](query + attn_out)
+            attn_out, _ = self.self_attn_layers[i](query, query, query, need_weights=False)
+            query = self.norm2[i](query + attn_out)
+            ffn_out = self.ffn_layers[i](query)
+            query = self.norm3[i](query + ffn_out)
+
+        if self.out_proj is not None:
+            query = self.out_proj(query)
+        return self.scale * query
+
+
+def _flatten_image_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    if tokens.ndim == 4:
+        return tokens.permute(0, 2, 3, 1).reshape(tokens.shape[0], -1, tokens.shape[1])
+    if tokens.ndim == 3:
+        return tokens
+    raise ValueError(f"Unexpected image token shape: {tuple(tokens.shape)}")
+
+
+def _encode_image_tokens(pipe: FluxFillPipeline, image: Image.Image) -> torch.Tensor:
+    image_tensor = pipe.image_processor.preprocess(
+        image,
+        height=image.height,
+        width=image.width,
+    )
+    image_tensor = image_tensor.to(pipe.device).to(pipe.dtype)
+    latents = pipe.vae.encode(image_tensor).latent_dist.sample()
+    latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+    tokens = pipe._pack_latents(latents, *latents.shape)
+    return _flatten_image_tokens(tokens)
+
+
+def _normalize_forward_args(args, kwargs):
+    names = [
+        "hidden_states",
+        "encoder_hidden_states",
+        "pooled_projections",
+        "timestep",
+        "img_ids",
+        "txt_ids",
+        "guidance",
+        "joint_attention_kwargs",
+        "return_dict",
+    ]
+    for i, value in enumerate(args):
+        if i < len(names):
+            kwargs[names[i]] = value
+    return kwargs
+
+
+def _patch_transformer_forward(transformer, model_config):
+    def _forward(self, *args, **kwargs):
+        kwargs = _normalize_forward_args(args, kwargs)
+        if "cross_attention_kwargs" in kwargs and "joint_attention_kwargs" not in kwargs:
+            kwargs["joint_attention_kwargs"] = kwargs.pop("cross_attention_kwargs")
+        adapter_tokens = getattr(self, "_adapter_tokens", None)
+        return tranformer_forward(
+            self,
+            condition_latents=None,
+            condition_ids=None,
+            condition_type_ids=None,
+            model_config=model_config,
+            c_t=0,
+            adapter_tokens=adapter_tokens,
+            **kwargs,
+        )
+
+    transformer.forward = types.MethodType(_forward, transformer)
+
+
+def _init_adapter_ca(transformer, state_list, ca_cfg):
+    scale_init = float(ca_cfg.get("scale", 0.0))
+    trainable_scale = bool(ca_cfg.get("trainable_scale", True))
+    modules = []
+    for idx, block in enumerate(transformer.transformer_blocks):
+        dim = int(getattr(block.attn.to_q, "in_features", block.attn.to_q.weight.shape[1]))
+        heads = int(getattr(block.attn, "heads", 8))
+        block.adapter_ca = AdapterCrossAttention(
+            dim=dim,
+            heads=heads,
+            scale_init=scale_init,
+            trainable_scale=trainable_scale,
+        )
+        if isinstance(state_list, list) and idx < len(state_list):
+            block.adapter_ca.load_state_dict(state_list[idx])
+        modules.append(block.adapter_ca)
+    return modules
+
+
 def _apply_gate(tokens: torch.Tensor, gate: torch.Tensor, mode: str, heads: int) -> torch.Tensor:
     if tokens is None:
         return tokens
@@ -312,6 +509,7 @@ def _load_adapters(adapter_dir: str, debug: bool):
     prompt_adapter = None
     token_adapter = None
     thermal_adapter = None
+    thermal_query_generator = None
     thermal_gate = None
     thermal_gate_balance_text = False
 
@@ -362,26 +560,48 @@ def _load_adapters(adapter_dir: str, debug: bool):
     if not thermal_enabled and os.path.exists(thermal_adapter_path):
         thermal_enabled = True
     if thermal_enabled:
-        thermal_dim = int(thermal_cfg.get("dim", adapter_cfg.get("pooled_dim", 768)))
-        thermal_token_dim = int(thermal_cfg.get("token_dim", thermal_dim))
-        thermal_num_tokens = int(thermal_cfg.get("num_tokens", 4))
-        thermal_scale = float(thermal_cfg.get("scale", 1.0))
-        thermal_init_std = float(thermal_cfg.get("init_std", 0.02))
-        thermal_adapter = ThermalTokenAdapter(
-            input_dim=thermal_dim,
-            token_dim=thermal_token_dim,
-            num_tokens=thermal_num_tokens,
-            scale=thermal_scale,
-            init_std=thermal_init_std,
-        )
-        if os.path.exists(thermal_adapter_path):
-            state = torch.load(thermal_adapter_path, map_location="cpu")
-            thermal_adapter.load_state_dict(state)
-            thermal_adapter.eval()
-            if debug:
-                print("[DEBUG][folder] loaded thermal_query:", thermal_adapter_path)
-        elif debug:
-            print("[DEBUG][folder] thermal_query enabled but file missing:", thermal_adapter_path)
+        thermal_mode = str(thermal_cfg.get("mode", "static")).lower()
+        if thermal_mode in ("query", "image_caption_query", "viscap_query"):
+            thermal_query_generator = ThermalQueryGenerator(
+                query_dim=int(thermal_cfg.get("query_dim", 256)),
+                output_dim=int(thermal_cfg.get("output_dim", thermal_cfg.get("query_dim", 256))),
+                num_queries=int(thermal_cfg.get("num_tokens", 4)),
+                num_heads=int(thermal_cfg.get("query_heads", 8)),
+                num_layers=int(thermal_cfg.get("query_layers", 2)),
+                ffn_dim=int(thermal_cfg.get("query_ffn_dim", 1024)),
+                scale=float(thermal_cfg.get("scale", 1.0)),
+                init_std=float(thermal_cfg.get("init_std", 0.02)),
+                use_type_embed=bool(thermal_cfg.get("use_type_embed", True)),
+            )
+            if os.path.exists(thermal_adapter_path):
+                state = torch.load(thermal_adapter_path, map_location="cpu")
+                thermal_query_generator.load_state_dict(state)
+                thermal_query_generator.eval()
+                if debug:
+                    print("[DEBUG][folder] loaded thermal_query generator:", thermal_adapter_path)
+            elif debug:
+                print("[DEBUG][folder] thermal_query generator enabled but file missing:", thermal_adapter_path)
+        else:
+            thermal_dim = int(thermal_cfg.get("dim", adapter_cfg.get("pooled_dim", 768)))
+            thermal_token_dim = int(thermal_cfg.get("token_dim", thermal_dim))
+            thermal_num_tokens = int(thermal_cfg.get("num_tokens", 4))
+            thermal_scale = float(thermal_cfg.get("scale", 1.0))
+            thermal_init_std = float(thermal_cfg.get("init_std", 0.02))
+            thermal_adapter = ThermalTokenAdapter(
+                input_dim=thermal_dim,
+                token_dim=thermal_token_dim,
+                num_tokens=thermal_num_tokens,
+                scale=thermal_scale,
+                init_std=thermal_init_std,
+            )
+            if os.path.exists(thermal_adapter_path):
+                state = torch.load(thermal_adapter_path, map_location="cpu")
+                thermal_adapter.load_state_dict(state)
+                thermal_adapter.eval()
+                if debug:
+                    print("[DEBUG][folder] loaded thermal_query:", thermal_adapter_path)
+            elif debug:
+                print("[DEBUG][folder] thermal_query enabled but file missing:", thermal_adapter_path)
 
         gate_cfg = thermal_cfg.get("gate", {}) or {}
         gate_enabled = bool(gate_cfg.get("enabled", False))
@@ -417,6 +637,7 @@ def _load_adapters(adapter_dir: str, debug: bool):
         prompt_adapter,
         token_adapter,
         thermal_adapter,
+        thermal_query_generator,
         thermal_gate,
         thermal_gate_balance_text,
         adapter_affect_prompt,
@@ -519,17 +740,44 @@ def main() -> int:
     if args.lora_path:
         _load_lora_weights(pipe, args.lora_path)
 
+    adapter_cfg = {}
+    adapter_ca_enabled = False
+    adapter_ca_concat = False
+    adapter_ca_cfg = {}
+    if args.adapter_dir is not None:
+        cfg_path = os.path.join(args.adapter_dir, "adapter_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                adapter_cfg = json.load(f)
+        thermal_cfg = adapter_cfg.get("thermal", {}) or {}
+        adapter_ca_cfg = thermal_cfg.get("adapter_ca", {}) or {}
+        thermal_adapter_ca_path = os.path.join(args.adapter_dir, "thermal_adapter_ca.pt")
+        if os.path.exists(thermal_adapter_ca_path):
+            adapter_ca_cfg.setdefault("enabled", True)
+        adapter_ca_enabled = bool(adapter_ca_cfg.get("enabled", False))
+        adapter_ca_concat = bool(adapter_ca_cfg.get("concat_to_text", False))
+        if adapter_ca_enabled:
+            adapter_ca_state = None
+            if os.path.exists(thermal_adapter_ca_path):
+                adapter_ca_state = torch.load(thermal_adapter_ca_path, map_location="cpu")
+            _init_adapter_ca(pipe.transformer, adapter_ca_state, adapter_ca_cfg)
+            model_cfg = adapter_cfg.get("model", {}) or {}
+            _patch_transformer_forward(pipe.transformer, model_cfg)
+
     prompt_adapter = None
     token_adapter = None
     thermal_adapter = None
+    thermal_query_generator = None
     thermal_gate = None
     thermal_gate_balance_text = False
     adapter_affect_prompt = True
+    current_thermal_image_tokens = None
     if args.adapter_dir is not None:
         (
             prompt_adapter,
             token_adapter,
             thermal_adapter,
+            thermal_query_generator,
             thermal_gate,
             thermal_gate_balance_text,
             adapter_affect_prompt,
@@ -538,6 +786,7 @@ def main() -> int:
             prompt_adapter is not None
             or token_adapter is not None
             or thermal_adapter is not None
+            or thermal_query_generator is not None
             or thermal_gate is not None
         ):
             orig_encode_prompt = pipe.encode_prompt
@@ -547,6 +796,7 @@ def main() -> int:
                     *encode_args, **encode_kwargs
                 )
                 adapter_pooled = pooled_prompt_embeds
+                caption_prompt_embeds = None
                 if caption is not None:
                     caption_kwargs = dict(encode_kwargs)
                     caption_kwargs.pop("prompt_embeds", None)
@@ -555,10 +805,12 @@ def main() -> int:
                     if encode_args:
                         caption_args = list(encode_args)
                         caption_args[0] = caption
-                        _, adapter_pooled, _ = orig_encode_prompt(*caption_args, **caption_kwargs)
+                        caption_prompt_embeds, adapter_pooled, _ = orig_encode_prompt(
+                            *caption_args, **caption_kwargs
+                        )
                     else:
                         caption_kwargs["prompt"] = caption
-                        _, adapter_pooled, _ = orig_encode_prompt(**caption_kwargs)
+                        caption_prompt_embeds, adapter_pooled, _ = orig_encode_prompt(**caption_kwargs)
 
                 if prompt_adapter is not None:
                     _ensure_module_on(prompt_adapter, adapter_pooled)
@@ -571,7 +823,24 @@ def main() -> int:
                     _ensure_module_on(thermal_gate, adapter_pooled)
                     gate = thermal_gate(adapter_pooled)
 
-                if thermal_adapter is not None:
+                thermal_tokens = None
+                if thermal_query_generator is not None:
+                    _ensure_module_on(thermal_query_generator, adapter_pooled)
+                    thermal_query_generator.ensure_output_dim(
+                        int(prompt_embeds.shape[-1]),
+                        device=adapter_pooled.device,
+                        dtype=adapter_pooled.dtype,
+                    )
+                    image_tokens = current_thermal_image_tokens
+                    if image_tokens is not None:
+                        image_tokens = image_tokens.to(
+                            device=adapter_pooled.device, dtype=adapter_pooled.dtype
+                        )
+                    thermal_tokens = thermal_query_generator(
+                        image_tokens=image_tokens,
+                        caption_tokens=caption_prompt_embeds,
+                    )
+                elif thermal_adapter is not None:
                     _ensure_module_on(thermal_adapter, adapter_pooled)
                     thermal_tokens = thermal_adapter(
                         adapter_pooled.shape[0],
@@ -579,6 +848,7 @@ def main() -> int:
                         device=adapter_pooled.device,
                         dtype=adapter_pooled.dtype,
                     )
+                if thermal_tokens is not None:
                     if gate is not None:
                         thermal_tokens = _apply_gate(
                             thermal_tokens,
@@ -586,10 +856,17 @@ def main() -> int:
                             thermal_gate.mode,
                             thermal_gate.heads,
                         )
-                    prompt_embeds = torch.cat(
-                        [prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1
-                    )
-                    text_ids = _extend_txt_ids(text_ids, thermal_tokens.shape[1])
+                    if adapter_ca_enabled:
+                        pipe.transformer._adapter_tokens = thermal_tokens.to(
+                            device=prompt_embeds.device, dtype=prompt_embeds.dtype
+                        )
+                    else:
+                        pipe.transformer._adapter_tokens = None
+                    if not adapter_ca_enabled or adapter_ca_concat:
+                        prompt_embeds = torch.cat(
+                            [prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1
+                        )
+                        text_ids = _extend_txt_ids(text_ids, thermal_tokens.shape[1])
                     if args.debug_adapter:
                         print(
                             "[DEBUG][folder] thermal_tokens injected",
@@ -598,6 +875,8 @@ def main() -> int:
                             "prompt_embeds.shape=",
                             tuple(prompt_embeds.shape),
                         )
+                elif adapter_ca_enabled:
+                    pipe.transformer._adapter_tokens = None
 
                 if token_adapter is not None:
                     _ensure_module_on(token_adapter, adapter_pooled)
@@ -650,6 +929,13 @@ def main() -> int:
         image = _resize_image(image, int(args.size), str(args.resize_mode))
         width, height = image.size
         combined_image, mask = _make_diptych_and_mask(image)
+        if thermal_query_generator is not None:
+            current_thermal_image_tokens = _encode_image_tokens(pipe, image)
+            if args.debug_adapter:
+                print(
+                    "[DEBUG][folder] thermal_image_tokens.shape=",
+                    tuple(current_thermal_image_tokens.shape),
+                )
 
         result = pipe(
             prompt=final_prompt,

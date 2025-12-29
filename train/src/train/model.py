@@ -9,6 +9,7 @@ import prodigyopt
 import json
 
 from ..flux.transformer import tranformer_forward
+from ..flux.block import AdapterCrossAttention
 from ..flux.condition import Condition
 from ..flux.pipeline_tools import encode_images, encode_images_fill, prepare_text_input
 
@@ -139,6 +140,116 @@ class ThermalGate(nn.Module):
         return torch.sigmoid(self.net(pooled))
 
 
+class ThermalQueryGenerator(nn.Module):
+    def __init__(
+        self,
+        query_dim: int,
+        output_dim: int,
+        num_queries: int = 4,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        ffn_dim: int = 1024,
+        scale: float = 1.0,
+        init_std: float = 0.02,
+        use_type_embed: bool = True,
+    ):
+        super().__init__()
+        if num_queries <= 0:
+            raise ValueError("num_queries must be > 0")
+        if query_dim % num_heads != 0:
+            raise ValueError("query_dim must be divisible by num_heads")
+        self.query_dim = int(query_dim)
+        self.output_dim = int(output_dim)
+        self.num_queries = int(num_queries)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.ffn_dim = int(ffn_dim)
+        self.scale = float(scale)
+        self.init_std = float(init_std)
+        self.use_type_embed = bool(use_type_embed)
+
+        self.query_embed = nn.Parameter(torch.randn(self.num_queries, self.query_dim) * self.init_std)
+        self.caption_proj = nn.LazyLinear(self.query_dim)
+        self.image_proj = nn.LazyLinear(self.query_dim)
+
+        if self.use_type_embed:
+            self.caption_type = nn.Parameter(torch.zeros(1, 1, self.query_dim))
+            self.image_type = nn.Parameter(torch.zeros(1, 1, self.query_dim))
+        else:
+            self.caption_type = None
+            self.image_type = None
+
+        self.cross_attn_layers = nn.ModuleList(
+            [
+                nn.MultiheadAttention(self.query_dim, self.num_heads, batch_first=True)
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.self_attn_layers = nn.ModuleList(
+            [
+                nn.MultiheadAttention(self.query_dim, self.num_heads, batch_first=True)
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.ffn_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.query_dim, self.ffn_dim),
+                    nn.SiLU(),
+                    nn.Linear(self.ffn_dim, self.query_dim),
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.norm1 = nn.ModuleList([nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+        self.norm2 = nn.ModuleList([nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+        self.norm3 = nn.ModuleList([nn.LayerNorm(self.query_dim) for _ in range(self.num_layers)])
+
+        self.out_proj = None
+        if self.output_dim != self.query_dim:
+            self.out_proj = nn.Linear(self.query_dim, self.output_dim)
+
+    def ensure_output_dim(self, target_dim: int, device: torch.device, dtype: torch.dtype) -> None:
+        if int(target_dim) == self.output_dim:
+            return
+        self.out_proj = nn.Linear(self.query_dim, int(target_dim)).to(device=device, dtype=dtype)
+        self.output_dim = int(target_dim)
+
+    def forward(
+        self,
+        image_tokens: torch.Tensor | None = None,
+        caption_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if image_tokens is None and caption_tokens is None:
+            raise ValueError("Either image_tokens or caption_tokens must be provided.")
+
+        memory = []
+        if caption_tokens is not None:
+            cap = self.caption_proj(caption_tokens)
+            if self.caption_type is not None:
+                cap = cap + self.caption_type
+            memory.append(cap)
+        if image_tokens is not None:
+            img = self.image_proj(image_tokens)
+            if self.image_type is not None:
+                img = img + self.image_type
+            memory.append(img)
+        memory = torch.cat(memory, dim=1)
+
+        query = self.query_embed.unsqueeze(0).expand(memory.shape[0], -1, -1)
+        for i in range(self.num_layers):
+            attn_out, _ = self.cross_attn_layers[i](query, memory, memory, need_weights=False)
+            query = self.norm1[i](query + attn_out)
+            attn_out, _ = self.self_attn_layers[i](query, query, query, need_weights=False)
+            query = self.norm2[i](query + attn_out)
+            ffn_out = self.ffn_layers[i](query)
+            query = self.norm3[i](query + ffn_out)
+
+        if self.out_proj is not None:
+            query = self.out_proj(query)
+        return self.scale * query
+
+
 def _apply_gate(tokens: torch.Tensor, gate: torch.Tensor, mode: str, heads: int) -> torch.Tensor:
     if tokens is None:
         return tokens
@@ -181,6 +292,15 @@ def _extend_txt_ids(txt_ids: torch.Tensor, extra_tokens: int) -> torch.Tensor:
     if add_batch_dim:
         out = out.unsqueeze(0)
     return out
+
+
+def _flatten_image_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    if tokens.ndim == 4:
+        # [B, C, H, W] -> [B, H*W, C]
+        return tokens.permute(0, 2, 3, 1).reshape(tokens.shape[0], -1, tokens.shape[1])
+    if tokens.ndim == 3:
+        return tokens
+    raise ValueError(f"Unexpected image token shape: {tuple(tokens.shape)}")
 
 
 class OminiModel(L.LightningModule):
@@ -229,13 +349,21 @@ class OminiModel(L.LightningModule):
             print('[debug] use OFFSET NOISE.')
             
         self.lora_layers = self.init_lora(lora_path, lora_config)
+        with torch.no_grad():
+            prompt_embeds, _, _ = prepare_text_input(self.flux_fill_pipe, ["warmup"])
+            self.text_embed_dim = int(prompt_embeds.shape[-1])
         (
             self.prompt_adapter,
             self.text_token_adapter,
             self.thermal_token_adapter,
+            self.thermal_query_generator,
             self.thermal_gate,
             self.thermal_gate_balance_text,
         ) = self._init_adapters()
+        self.adapter_ca_layers = []
+        self.thermal_adapter_ca_enabled = False
+        self.thermal_adapter_ca_concat = False
+        self._init_adapter_ca()
 
         self.to(device).to(dtype)
 
@@ -251,7 +379,9 @@ class OminiModel(L.LightningModule):
         text_ids: torch.Tensor,
         pooled_prompt_embeds_adapter: torch.Tensor | None = None,
         apply_to_pooled_prompt: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        thermal_image_tokens: torch.Tensor | None = None,
+        thermal_caption_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         adapter_pooled = pooled_prompt_embeds if pooled_prompt_embeds_adapter is None else pooled_prompt_embeds_adapter
         if self.prompt_adapter is not None:
             adapter_pooled = self.prompt_adapter(adapter_pooled)
@@ -265,13 +395,21 @@ class OminiModel(L.LightningModule):
         if self.thermal_gate is not None:
             gate = self.thermal_gate(adapter_pooled)
 
-        if self.thermal_token_adapter is not None:
+        thermal_tokens = None
+        if self.thermal_query_generator is not None:
+            thermal_tokens = self.thermal_query_generator(
+                image_tokens=thermal_image_tokens,
+                caption_tokens=thermal_caption_tokens,
+            )
+        elif self.thermal_token_adapter is not None:
             thermal_tokens = self.thermal_token_adapter(
                 adapter_pooled.shape[0],
                 target_dim=int(prompt_embeds.shape[-1]),
                 device=adapter_pooled.device,
                 dtype=adapter_pooled.dtype,
             )
+        adapter_ca_tokens = None
+        if thermal_tokens is not None:
             if gate is not None:
                 thermal_tokens = _apply_gate(
                     thermal_tokens,
@@ -279,8 +417,11 @@ class OminiModel(L.LightningModule):
                     self.thermal_gate.mode,
                     self.thermal_gate.heads,
                 )
-            prompt_embeds = torch.cat([prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1)
-            text_ids = _extend_txt_ids(text_ids, thermal_tokens.shape[1])
+            if self.thermal_adapter_ca_enabled:
+                adapter_ca_tokens = thermal_tokens
+            if not self.thermal_adapter_ca_enabled or self.thermal_adapter_ca_concat:
+                prompt_embeds = torch.cat([prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1)
+                text_ids = _extend_txt_ids(text_ids, thermal_tokens.shape[1])
             if self.debug_config.get("enabled", False) and (not self._debug_printed_step):
                 self._debug(
                     "thermal_tokens injected",
@@ -320,12 +461,12 @@ class OminiModel(L.LightningModule):
                     "txt_ids_len", orig_txt_ids_len, "->", new_txt_ids_len,
                 )
 
-        return prompt_embeds, pooled_prompt_embeds, text_ids
+        return prompt_embeds, pooled_prompt_embeds, text_ids, adapter_ca_tokens
 
     def _init_adapters(self):
         cfg = self.adapter_config or {}
         if not cfg.get("enabled", False):
-            return None, None, None, None, False
+            return None, None, None, None, None, False
 
         kind = str(cfg.get("kind", "pooled")).lower()
         scale = float(cfg.get("scale", 1.0))
@@ -333,6 +474,7 @@ class OminiModel(L.LightningModule):
         pooled_adapter = None
         token_adapter = None
         thermal_adapter = None
+        thermal_query_generator = None
         thermal_gate = None
         thermal_gate_balance_text = False
 
@@ -357,25 +499,46 @@ class OminiModel(L.LightningModule):
 
         thermal_cfg = cfg.get("thermal", {}) or {}
         if thermal_cfg.get("enabled", False):
-            thermal_dim = int(thermal_cfg.get("dim", cfg.get("pooled_dim", cfg.get("dim", 768))))
-            thermal_token_dim = int(thermal_cfg.get("token_dim", thermal_dim))
-            thermal_num_tokens = int(thermal_cfg.get("num_tokens", 4))
-            thermal_scale = float(thermal_cfg.get("scale", 1.0))
-            thermal_init_std = float(thermal_cfg.get("init_std", 0.02))
-            thermal_adapter = ThermalTokenAdapter(
-                input_dim=thermal_dim,
-                token_dim=thermal_token_dim,
-                num_tokens=thermal_num_tokens,
-                scale=thermal_scale,
-                init_std=thermal_init_std,
-            )
+            thermal_mode = str(thermal_cfg.get("mode", "static")).lower()
+            if thermal_mode in ("query", "image_caption_query", "viscap_query"):
+                query_dim = int(thermal_cfg.get("query_dim", self.text_embed_dim))
+                thermal_query_generator = ThermalQueryGenerator(
+                    query_dim=query_dim,
+                    output_dim=int(thermal_cfg.get("output_dim", self.text_embed_dim)),
+                    num_queries=int(thermal_cfg.get("num_tokens", 4)),
+                    num_heads=int(thermal_cfg.get("query_heads", 8)),
+                    num_layers=int(thermal_cfg.get("query_layers", 2)),
+                    ffn_dim=int(thermal_cfg.get("query_ffn_dim", query_dim * 4)),
+                    scale=float(thermal_cfg.get("scale", 1.0)),
+                    init_std=float(thermal_cfg.get("init_std", 0.02)),
+                    use_type_embed=bool(thermal_cfg.get("use_type_embed", True)),
+                )
+            else:
+                thermal_dim = int(thermal_cfg.get("dim", cfg.get("pooled_dim", cfg.get("dim", 768))))
+                thermal_token_dim = int(thermal_cfg.get("token_dim", thermal_dim))
+                thermal_num_tokens = int(thermal_cfg.get("num_tokens", 4))
+                thermal_scale = float(thermal_cfg.get("scale", 1.0))
+                thermal_init_std = float(thermal_cfg.get("init_std", 0.02))
+                thermal_adapter = ThermalTokenAdapter(
+                    input_dim=thermal_dim,
+                    token_dim=thermal_token_dim,
+                    num_tokens=thermal_num_tokens,
+                    scale=thermal_scale,
+                    init_std=thermal_init_std,
+                )
 
             gate_cfg = thermal_cfg.get("gate", {}) or {}
             if gate_cfg.get("enabled", False):
+                gate_default_dim = int(
+                    gate_cfg.get(
+                        "dim",
+                        thermal_cfg.get("dim", cfg.get("pooled_dim", cfg.get("dim", 768))),
+                    )
+                )
                 gate_mode = str(gate_cfg.get("mode", "global")).lower()
                 gate_heads = int(gate_cfg.get("heads", 8))
                 gate_hidden_dim = int(gate_cfg.get("hidden_dim", 0))
-                gate_dim = int(gate_cfg.get("dim", thermal_dim))
+                gate_dim = int(gate_cfg.get("dim", gate_default_dim))
                 thermal_gate_balance_text = bool(gate_cfg.get("balance_text_tokens", False))
                 thermal_gate = ThermalGate(
                     input_dim=gate_dim,
@@ -384,7 +547,34 @@ class OminiModel(L.LightningModule):
                     hidden_dim=gate_hidden_dim,
                 )
 
-        return pooled_adapter, token_adapter, thermal_adapter, thermal_gate, thermal_gate_balance_text
+        return (
+            pooled_adapter,
+            token_adapter,
+            thermal_adapter,
+            thermal_query_generator,
+            thermal_gate,
+            thermal_gate_balance_text,
+        )
+
+    def _init_adapter_ca(self) -> None:
+        thermal_cfg = (self.adapter_config or {}).get("thermal", {}) or {}
+        ca_cfg = thermal_cfg.get("adapter_ca", {}) or {}
+        if not ca_cfg.get("enabled", False):
+            return
+        scale_init = float(ca_cfg.get("scale", 0.0))
+        trainable_scale = bool(ca_cfg.get("trainable_scale", True))
+        self.thermal_adapter_ca_concat = bool(ca_cfg.get("concat_to_text", False))
+        for block in self.transformer.transformer_blocks:
+            dim = int(getattr(block.attn.to_q, "in_features", block.attn.to_q.weight.shape[1]))
+            heads = int(getattr(block.attn, "heads", 8))
+            block.adapter_ca = AdapterCrossAttention(
+                dim=dim,
+                heads=heads,
+                scale_init=scale_init,
+                trainable_scale=trainable_scale,
+            )
+            self.adapter_ca_layers.append(block.adapter_ca)
+        self.thermal_adapter_ca_enabled = True
 
     def init_lora(self, lora_path: str, lora_config: dict):
         assert lora_path or lora_config
@@ -412,6 +602,7 @@ class OminiModel(L.LightningModule):
             self.prompt_adapter is not None
             or self.text_token_adapter is not None
             or self.thermal_token_adapter is not None
+            or self.thermal_query_generator is not None
             or self.thermal_gate is not None
         ):
             os.makedirs(path, exist_ok=True)
@@ -421,12 +612,20 @@ class OminiModel(L.LightningModule):
                 torch.save(self.text_token_adapter.state_dict(), os.path.join(path, "text_token_adapter.pt"))
             if self.thermal_token_adapter is not None:
                 torch.save(self.thermal_token_adapter.state_dict(), os.path.join(path, "thermal_query.pt"))
+            if self.thermal_query_generator is not None:
+                torch.save(self.thermal_query_generator.state_dict(), os.path.join(path, "thermal_query.pt"))
+            if self.adapter_ca_layers:
+                torch.save(
+                    [layer.state_dict() for layer in self.adapter_ca_layers],
+                    os.path.join(path, "thermal_adapter_ca.pt"),
+                )
             if self.thermal_gate is not None:
                 torch.save(self.thermal_gate.state_dict(), os.path.join(path, "thermal_gate.pt"))
 
             # Persist a resolved adapter config so inference can reconstruct modules with correct dims.
             resolved = dict(self.adapter_config or {})
             resolved.setdefault("enabled", True)
+            resolved.setdefault("model", dict(self.model_config or {}))
             if self.prompt_adapter is not None:
                 # infer dims from module weights (robust to config mismatches)
                 resolved.setdefault("kind", "pooled")
@@ -449,15 +648,46 @@ class OminiModel(L.LightningModule):
                 thermal_resolved["num_tokens"] = int(getattr(self.thermal_token_adapter, "num_tokens", 4))
                 thermal_resolved["scale"] = float(getattr(self.thermal_token_adapter, "scale", 1.0))
                 thermal_resolved["init_std"] = float(getattr(self.thermal_token_adapter, "init_std", 0.02))
-                if self.thermal_gate is not None:
-                    gate_resolved = dict(thermal_resolved.get("gate", {}) or {})
-                    gate_resolved["enabled"] = True
-                    gate_resolved["mode"] = str(getattr(self.thermal_gate, "mode", "global"))
-                    gate_resolved["heads"] = int(getattr(self.thermal_gate, "heads", 1))
-                    gate_resolved["hidden_dim"] = int(getattr(self.thermal_gate, "hidden_dim", 0))
-                    gate_resolved["dim"] = int(getattr(self.thermal_gate, "input_dim", thermal_resolved["dim"]))
-                    gate_resolved["balance_text_tokens"] = bool(self.thermal_gate_balance_text)
-                    thermal_resolved["gate"] = gate_resolved
+                thermal_resolved["mode"] = str(thermal_resolved.get("mode", "static"))
+                resolved["thermal"] = thermal_resolved
+            if self.thermal_query_generator is not None:
+                thermal_resolved = dict(resolved.get("thermal", {}) or {})
+                thermal_resolved["enabled"] = True
+                thermal_resolved["mode"] = str(thermal_resolved.get("mode", "query"))
+                thermal_resolved["num_tokens"] = int(getattr(self.thermal_query_generator, "num_queries", 4))
+                thermal_resolved["query_dim"] = int(getattr(self.thermal_query_generator, "query_dim", self.text_embed_dim))
+                thermal_resolved["output_dim"] = int(getattr(self.thermal_query_generator, "output_dim", self.text_embed_dim))
+                thermal_resolved["query_heads"] = int(getattr(self.thermal_query_generator, "num_heads", 8))
+                thermal_resolved["query_layers"] = int(getattr(self.thermal_query_generator, "num_layers", 2))
+                thermal_resolved["query_ffn_dim"] = int(getattr(self.thermal_query_generator, "ffn_dim", self.text_embed_dim * 4))
+                thermal_resolved["scale"] = float(getattr(self.thermal_query_generator, "scale", 1.0))
+                thermal_resolved["init_std"] = float(getattr(self.thermal_query_generator, "init_std", 0.02))
+                thermal_resolved["use_type_embed"] = bool(getattr(self.thermal_query_generator, "use_type_embed", True))
+                if self.thermal_adapter_ca_enabled:
+                    scale_param = self.adapter_ca_layers[0].scale if self.adapter_ca_layers else None
+                    trainable_scale = bool(isinstance(scale_param, torch.nn.Parameter)) if scale_param is not None else True
+                    thermal_resolved["adapter_ca"] = {
+                        "enabled": True,
+                        "concat_to_text": bool(self.thermal_adapter_ca_concat),
+                        "trainable_scale": trainable_scale,
+                    }
+                resolved["thermal"] = thermal_resolved
+            if self.thermal_gate is not None:
+                thermal_resolved = dict(resolved.get("thermal", {}) or {})
+                gate_resolved = dict(thermal_resolved.get("gate", {}) or {})
+                gate_resolved["enabled"] = True
+                gate_resolved["mode"] = str(getattr(self.thermal_gate, "mode", "global"))
+                gate_resolved["heads"] = int(getattr(self.thermal_gate, "heads", 1))
+                gate_resolved["hidden_dim"] = int(getattr(self.thermal_gate, "hidden_dim", 0))
+                gate_resolved["dim"] = int(
+                    getattr(
+                        self.thermal_gate,
+                        "input_dim",
+                        thermal_resolved.get("dim", thermal_resolved.get("output_dim", self.text_embed_dim)),
+                    )
+                )
+                gate_resolved["balance_text_tokens"] = bool(self.thermal_gate_balance_text)
+                thermal_resolved["gate"] = gate_resolved
                 resolved["thermal"] = thermal_resolved
 
             with open(os.path.join(path, "adapter_config.json"), "w", encoding="utf-8") as f:
@@ -477,6 +707,11 @@ class OminiModel(L.LightningModule):
                 self.trainable_params += list(self.text_token_adapter.parameters())
             if self.thermal_token_adapter is not None:
                 self.trainable_params += list(self.thermal_token_adapter.parameters())
+            if self.thermal_query_generator is not None:
+                self.trainable_params += list(self.thermal_query_generator.parameters())
+            if self.adapter_ca_layers:
+                for layer in self.adapter_ca_layers:
+                    self.trainable_params += list(layer.parameters())
             if self.thermal_gate is not None:
                 self.trainable_params += list(self.thermal_gate.parameters())
 
@@ -500,6 +735,11 @@ class OminiModel(L.LightningModule):
             thermal_numel = 0
             if self.thermal_token_adapter is not None:
                 thermal_numel += sum(int(p.numel()) for p in self.thermal_token_adapter.parameters())
+            if self.thermal_query_generator is not None:
+                thermal_numel += sum(int(p.numel()) for p in self.thermal_query_generator.parameters())
+            if self.adapter_ca_layers:
+                for layer in self.adapter_ca_layers:
+                    thermal_numel += sum(int(p.numel()) for p in layer.parameters())
             gate_numel = 0
             if self.thermal_gate is not None:
                 gate_numel += sum(int(p.numel()) for p in self.thermal_gate.parameters())
@@ -545,13 +785,17 @@ class OminiModel(L.LightningModule):
         captions = batch.get("caption")
         position_delta = batch["position_delta"][0]
 
+        thermal_image_tokens = None
+        thermal_caption_tokens = None
+
         with torch.no_grad():
             prompt_embeds, pooled_prompt_embeds, text_ids = prepare_text_input(
                 self.flux_fill_pipe, prompts
             )
             pooled_prompt_embeds_adapter = pooled_prompt_embeds
+            caption_prompt_embeds = None
             if captions is not None:
-                _, pooled_prompt_embeds_adapter, _ = prepare_text_input(
+                caption_prompt_embeds, pooled_prompt_embeds_adapter, _ = prepare_text_input(
                     self.flux_fill_pipe, captions
                 )
             x_0, x_cond, img_ids, mask_tokens = encode_images_fill(
@@ -562,6 +806,18 @@ class OminiModel(L.LightningModule):
                 prompt_embeds.device,
                 return_mask_tokens=True,
             )
+            if self.thermal_query_generator is not None:
+                width = int(imgs.shape[-1] // 2)
+                vis = imgs[:, :, :, :width]
+                vis_tokens, _ = encode_images(self.flux_fill_pipe, vis)
+                thermal_image_tokens = _flatten_image_tokens(vis_tokens).to(
+                    device=prompt_embeds.device,
+                    dtype=prompt_embeds.dtype,
+                )
+                if caption_prompt_embeds is not None:
+                    thermal_caption_tokens = caption_prompt_embeds
+                else:
+                    thermal_caption_tokens = prompt_embeds
 
             # Prepare t (sigma) and x_t
             sigma_schedule = self.loss_config.get("sigma_schedule", None)
@@ -603,35 +859,60 @@ class OminiModel(L.LightningModule):
 
         if self.adapter_trainable:
             apply_to_pooled_prompt = self.adapter_affect_prompt and captions is None
-            prompt_embeds, pooled_prompt_embeds, text_ids = self._apply_adapters(
+            prompt_embeds, pooled_prompt_embeds, text_ids, adapter_tokens = self._apply_adapters(
                 prompt_embeds,
                 pooled_prompt_embeds,
                 text_ids,
                 pooled_prompt_embeds_adapter=pooled_prompt_embeds_adapter,
                 apply_to_pooled_prompt=apply_to_pooled_prompt,
+                thermal_image_tokens=thermal_image_tokens,
+                thermal_caption_tokens=thermal_caption_tokens,
             )
         else:
             with torch.no_grad():
                 apply_to_pooled_prompt = self.adapter_affect_prompt and captions is None
-                prompt_embeds, pooled_prompt_embeds, text_ids = self._apply_adapters(
+                prompt_embeds, pooled_prompt_embeds, text_ids, adapter_tokens = self._apply_adapters(
                     prompt_embeds,
                     pooled_prompt_embeds,
                     text_ids,
                     pooled_prompt_embeds_adapter=pooled_prompt_embeds_adapter,
                     apply_to_pooled_prompt=apply_to_pooled_prompt,
+                    thermal_image_tokens=thermal_image_tokens,
+                    thermal_caption_tokens=thermal_caption_tokens,
                 )
 
         # Forward pass
-        transformer_out = self.transformer(
-            hidden_states=torch.cat((x_t, x_cond), dim=2),
-            timestep=t,
-            guidance=guidance,
-            pooled_projections=pooled_prompt_embeds,
-            encoder_hidden_states=prompt_embeds,
-            txt_ids=text_ids,
-            img_ids=img_ids,
-            joint_attention_kwargs=None,
-            return_dict=False,
+        hidden_states = torch.cat((x_t, x_cond), dim=2)
+        if self.thermal_adapter_ca_enabled:
+            transformer_out = tranformer_forward(
+                self.transformer,
+                condition_latents=None,
+                condition_ids=None,
+                condition_type_ids=None,
+                model_config=self.model_config,
+                c_t=0,
+                adapter_tokens=adapter_tokens,
+                hidden_states=hidden_states,
+                timestep=t,
+                guidance=guidance,
+                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=img_ids,
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )
+        else:
+            transformer_out = self.transformer(
+                hidden_states=hidden_states,
+                timestep=t,
+                guidance=guidance,
+                pooled_projections=pooled_prompt_embeds,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=img_ids,
+                joint_attention_kwargs=None,
+                return_dict=False,
             )
         pred = transformer_out[0]
 
