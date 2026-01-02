@@ -52,6 +52,7 @@ def tranformer_forward(
     model_config: Optional[Dict[str, Any]] = {},
     c_t=0,
     adapter_tokens: torch.Tensor = None,
+    adapter_token_mask: torch.Tensor = None,
     **params: dict,
 ):
     self = transformer
@@ -150,6 +151,7 @@ def tranformer_forward(
                     encoder_hidden_states=encoder_hidden_states,
                     condition_latents=condition_latents if use_condition else None,
                     adapter_tokens=adapter_tokens,
+                    adapter_token_mask=adapter_token_mask,
                     temb=temb,
                     cond_temb=cond_temb if use_condition else None,
                     cond_rotary_emb=cond_rotary_emb if use_condition else None,
@@ -166,6 +168,7 @@ def tranformer_forward(
                 encoder_hidden_states=encoder_hidden_states,
                 condition_latents=condition_latents if use_condition else None,
                 adapter_tokens=adapter_tokens,
+                adapter_token_mask=adapter_token_mask,
                 temb=temb,
                 cond_temb=cond_temb if use_condition else None,
                 cond_rotary_emb=cond_rotary_emb if use_condition else None,

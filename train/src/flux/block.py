@@ -224,6 +224,7 @@ def block_forward(
     encoder_hidden_states: torch.FloatTensor,
     condition_latents: torch.FloatTensor,
     adapter_tokens: torch.FloatTensor,
+    adapter_token_mask: torch.FloatTensor = None,
     temb: torch.FloatTensor,
     cond_temb: torch.FloatTensor,
     cond_rotary_emb=None,
@@ -272,6 +273,14 @@ def block_forward(
             device=norm_hidden_states.device, dtype=norm_hidden_states.dtype
         )
         adapter_out = self.adapter_ca(norm_hidden_states, adapter_tokens)
+        if adapter_token_mask is not None:
+            mask = adapter_token_mask
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(-1)
+            elif mask.ndim == 3 and mask.shape[-1] != 1:
+                mask = mask.mean(dim=-1, keepdim=True)
+            mask = mask.to(device=adapter_out.device, dtype=adapter_out.dtype)
+            adapter_out = adapter_out * mask
         hidden_states = hidden_states + adapter_out
     # 2. encoder_hidden_states
     context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output

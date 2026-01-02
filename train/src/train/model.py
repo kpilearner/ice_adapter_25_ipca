@@ -884,6 +884,15 @@ class OminiModel(L.LightningModule):
         # Forward pass
         hidden_states = torch.cat((x_t, x_cond), dim=2)
         if self.thermal_adapter_ca_enabled:
+            adapter_token_mask = None
+            if mask_tokens is not None:
+                adapter_token_mask = mask_tokens
+                if adapter_token_mask.ndim == 3:
+                    adapter_token_mask = adapter_token_mask.mean(dim=-1)
+                adapter_token_mask = adapter_token_mask.to(
+                    device=prompt_embeds.device,
+                    dtype=prompt_embeds.dtype,
+                ).clamp(0, 1)
             transformer_out = tranformer_forward(
                 self.transformer,
                 condition_latents=None,
@@ -892,6 +901,7 @@ class OminiModel(L.LightningModule):
                 model_config=self.model_config,
                 c_t=0,
                 adapter_tokens=adapter_tokens,
+                adapter_token_mask=adapter_token_mask,
                 hidden_states=hidden_states,
                 timestep=t,
                 guidance=guidance,

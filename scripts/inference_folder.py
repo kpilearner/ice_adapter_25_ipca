@@ -314,6 +314,50 @@ def _encode_image_tokens(pipe: FluxFillPipeline, image: Image.Image) -> torch.Te
     return _flatten_image_tokens(tokens)
 
 
+def _pack_mask_tokens(pipe: FluxFillPipeline, mask_latents: torch.Tensor) -> torch.Tensor:
+    if mask_latents.ndim == 4:
+        if mask_latents.shape[1] != 1 and mask_latents.shape[-1] == 1:
+            mask_latents = mask_latents.permute(0, 3, 1, 2)
+        return pipe._pack_latents(mask_latents, *mask_latents.shape)
+    if mask_latents.ndim == 3:
+        return mask_latents
+    raise ValueError(f"Unexpected mask latent shape: {tuple(mask_latents.shape)}")
+
+
+def _encode_mask_tokens(
+    pipe: FluxFillPipeline, image: Image.Image, mask: Image.Image
+) -> torch.Tensor:
+    image_tensor = pipe.image_processor.preprocess(
+        image,
+        height=image.height,
+        width=image.width,
+    )
+    mask_tensor = pipe.mask_processor.preprocess(
+        mask,
+        height=image.height,
+        width=image.width,
+    )
+    image_tensor = image_tensor.to(pipe.device).to(pipe.dtype)
+    mask_tensor = mask_tensor.to(pipe.device).to(pipe.dtype)
+    masked_image = image_tensor * (1 - mask_tensor)
+    num_channels_latents = pipe.vae.config.latent_channels
+    height, width = image_tensor.shape[-2:]
+    device = pipe._execution_device
+    mask_latents, _ = pipe.prepare_mask_latents(
+        mask_tensor,
+        masked_image,
+        image_tensor.shape[0],
+        num_channels_latents,
+        1,
+        height,
+        width,
+        pipe.dtype,
+        device,
+        None,
+    )
+    return _pack_mask_tokens(pipe, mask_latents)
+
+
 def _normalize_forward_args(args, kwargs):
     names = [
         "hidden_states",
@@ -338,6 +382,7 @@ def _patch_transformer_forward(transformer, model_config):
         if "cross_attention_kwargs" in kwargs and "joint_attention_kwargs" not in kwargs:
             kwargs["joint_attention_kwargs"] = kwargs.pop("cross_attention_kwargs")
         adapter_tokens = getattr(self, "_adapter_tokens", None)
+        adapter_token_mask = getattr(self, "_adapter_token_mask", None)
         return tranformer_forward(
             self,
             condition_latents=None,
@@ -346,6 +391,7 @@ def _patch_transformer_forward(transformer, model_config):
             model_config=model_config,
             c_t=0,
             adapter_tokens=adapter_tokens,
+            adapter_token_mask=adapter_token_mask,
             **kwargs,
         )
 
@@ -365,6 +411,8 @@ def _init_adapter_ca(transformer, state_list, ca_cfg):
             scale_init=scale_init,
             trainable_scale=trainable_scale,
         )
+        ref_weight = block.attn.to_q.weight
+        block.adapter_ca.to(device=ref_weight.device, dtype=ref_weight.dtype)
         if isinstance(state_list, list) and idx < len(state_list):
             block.adapter_ca.load_state_dict(state_list[idx])
         modules.append(block.adapter_ca)
@@ -772,6 +820,7 @@ def main() -> int:
     thermal_gate_balance_text = False
     adapter_affect_prompt = True
     current_thermal_image_tokens = None
+    current_adapter_token_mask = None
     if args.adapter_dir is not None:
         (
             prompt_adapter,
@@ -860,8 +909,15 @@ def main() -> int:
                         pipe.transformer._adapter_tokens = thermal_tokens.to(
                             device=prompt_embeds.device, dtype=prompt_embeds.dtype
                         )
+                        if current_adapter_token_mask is not None:
+                            pipe.transformer._adapter_token_mask = current_adapter_token_mask.to(
+                                device=prompt_embeds.device, dtype=prompt_embeds.dtype
+                            )
+                        else:
+                            pipe.transformer._adapter_token_mask = None
                     else:
                         pipe.transformer._adapter_tokens = None
+                        pipe.transformer._adapter_token_mask = None
                     if not adapter_ca_enabled or adapter_ca_concat:
                         prompt_embeds = torch.cat(
                             [prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1
@@ -877,6 +933,7 @@ def main() -> int:
                         )
                 elif adapter_ca_enabled:
                     pipe.transformer._adapter_tokens = None
+                    pipe.transformer._adapter_token_mask = None
 
                 if token_adapter is not None:
                     _ensure_module_on(token_adapter, adapter_pooled)
@@ -929,6 +986,8 @@ def main() -> int:
         image = _resize_image(image, int(args.size), str(args.resize_mode))
         width, height = image.size
         combined_image, mask = _make_diptych_and_mask(image)
+        if adapter_ca_enabled:
+            current_adapter_token_mask = _encode_mask_tokens(pipe, combined_image, mask)
         if thermal_query_generator is not None:
             current_thermal_image_tokens = _encode_image_tokens(pipe, image)
             if args.debug_adapter:
