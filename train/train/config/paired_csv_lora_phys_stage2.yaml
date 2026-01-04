@@ -1,0 +1,95 @@
+flux_path: "/root/autodl-tmp/model/hfd_model"
+dtype: "bfloat16"
+
+model:
+  union_cond_attn: true
+  add_cond_attn: false
+  latent_lora: false
+  use_sep: false
+
+train:
+  batch_size: 4
+  accumulate_grad_batches: 1
+  dataloader_workers: 8
+  save_interval: 1000
+  sample_interval: 0
+  max_steps: -1
+  gradient_checkpointing: true
+  save_path: "runs_msrs_phys_stage2"
+
+  dataset:
+    type: "paired_csv"
+    base_path: ""
+    metadata_path: "/root/autodl-tmp/datasets/MSRS/metadata_train_with_prompts.csv"
+    source_key: "kontext_images"
+    target_key: "image"
+    prompt_key: "prompt"
+    instruction_text: "A diptych with two side-by-side images of the same scene. The left image is visible light. The right image is the corresponding infrared thermal image. Instruction: Transform the visible image into its infrared thermal counterpart while preserving scene structure and objects."
+    caption_key: "prompt"
+    caption_prefix: ""
+    default_caption: ""
+    condition_size: 512
+    target_size: 512
+    drop_text_prob: 0.0
+
+  loss:
+    use_masked_loss: true
+    masked_weight: 1.0
+    unmasked_weight: 0.0
+    sigma_schedule: "flux_shifted_1000"
+    schedule_steps: 1000
+    t_weighting: "flux_gaussian"
+    loss_dtype: "float32"
+    diff_weight: 0.2
+    phys:
+      enabled: true
+      weight: 0.1
+      gray_weight: 0.02
+      grad_weight: 0.05
+      t_weighting: "one_minus_t"
+      t_power: 1.0
+
+  adapter:
+    enabled: true
+    trainable: false
+    affect_prompt: false
+    load_dir: "/root/autodl-tmp/runs_msrs_text_stage1/ckpt/10000"
+    kind: "tokens"
+    pooled_dim: 768
+    num_tokens: 8
+    token_hidden_dim: 1536
+    scale: 1.0
+    thermal:
+      enabled: false
+
+  debug:
+    enabled: false
+
+  lora_config:
+    adapters:
+      - name: "default"
+        path: "/root/autodl-tmp/runs_msrs_text_stage1/ckpt/10000"
+        trainable: false
+        scale: 1.0
+        config:
+          r: 128
+          lora_alpha: 128
+          init_lora_weights: "gaussian"
+          target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_k_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_q_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_v_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_add_out|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
+      - name: "phys"
+        trainable: true
+        scale: 1.0
+        config:
+          r: 64
+          lora_alpha: 64
+          init_lora_weights: "gaussian"
+          target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_k_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_q_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.add_v_proj|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_add_out|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
+    active: ["default", "phys"]
+    save_adapters: ["phys"]
+
+  optimizer:
+    type: "AdamW"
+    params:
+      lr: 1.0e-4
+      betas: [0.9, 0.999]
+      weight_decay: 0.01

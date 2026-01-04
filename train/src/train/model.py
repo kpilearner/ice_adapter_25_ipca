@@ -7,6 +7,12 @@ from peft import LoraConfig, get_peft_model_state_dict
 import os
 import prodigyopt
 import json
+from pathlib import Path
+
+try:
+    from peft import set_peft_model_state_dict
+except Exception:  # pragma: no cover - optional PEFT API
+    set_peft_model_state_dict = None
 
 from ..flux.transformer import tranformer_forward
 from ..flux.block import AdapterCrossAttention
@@ -360,6 +366,7 @@ class OminiModel(L.LightningModule):
             self.thermal_gate,
             self.thermal_gate_balance_text,
         ) = self._init_adapters()
+        self._load_adapter_weights(self.adapter_config.get("load_dir"))
         self.adapter_ca_layers = []
         self.thermal_adapter_ca_enabled = False
         self.thermal_adapter_ca_concat = False
@@ -371,6 +378,74 @@ class OminiModel(L.LightningModule):
         if not self.debug_config.get("enabled", False):
             return
         print("[DEBUG][OminiModel]", *args)
+
+    def _load_lora_state_dict(self, lora_path: str) -> dict:
+        path = Path(lora_path).expanduser()
+        if path.is_dir():
+            for name in (
+                "pytorch_lora_weights.safetensors",
+                "pytorch_lora_weights.bin",
+                "adapter_model.safetensors",
+                "adapter_model.bin",
+            ):
+                candidate = path / name
+                if candidate.exists():
+                    path = candidate
+                    break
+        if not path.exists():
+            raise FileNotFoundError(f"LoRA weights not found: {path}")
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            return load_file(str(path))
+        return torch.load(str(path), map_location="cpu")
+
+    def _rewrite_lora_adapter_keys(self, state_dict: dict, adapter_name: str) -> dict:
+        if adapter_name == "default":
+            return state_dict
+        if not any(".default." in key for key in state_dict.keys()):
+            return state_dict
+        return {
+            key.replace(".default.", f".{adapter_name}."): value
+            for key, value in state_dict.items()
+        }
+
+    def _load_lora_into_adapter(self, adapter_name: str, lora_path: str) -> None:
+        state_dict = self._load_lora_state_dict(lora_path)
+        state_dict = self._rewrite_lora_adapter_keys(state_dict, adapter_name)
+        if set_peft_model_state_dict is not None:
+            set_peft_model_state_dict(self.transformer, state_dict, adapter_name=adapter_name)
+        else:
+            self.transformer.load_state_dict(state_dict, strict=False)
+
+    def _set_active_lora_adapters(self, adapter_names: list[str], adapter_scales: list[float]) -> None:
+        if not adapter_names:
+            return
+        if hasattr(self.flux_fill_pipe, "set_adapters"):
+            try:
+                self.flux_fill_pipe.set_adapters(adapter_names, adapter_scales)
+            except TypeError:
+                self.flux_fill_pipe.set_adapters(adapter_names)
+            return
+        if hasattr(self.transformer, "set_adapters"):
+            try:
+                self.transformer.set_adapters(adapter_names, adapter_scales)
+            except TypeError:
+                self.transformer.set_adapters(adapter_names)
+            return
+        if hasattr(self.transformer, "set_adapter"):
+            self.transformer.set_adapter(adapter_names)
+
+    def _collect_lora_params(self, adapter_names: list[str]) -> list[torch.nn.Parameter]:
+        if not adapter_names:
+            return []
+        params: list[torch.nn.Parameter] = []
+        for name, param in self.transformer.named_parameters():
+            if "lora" not in name:
+                continue
+            if any(f".{adapter_name}." in name for adapter_name in adapter_names):
+                params.append(param)
+        return params
 
     def _apply_adapters(
         self,
@@ -462,6 +537,28 @@ class OminiModel(L.LightningModule):
                 )
 
         return prompt_embeds, pooled_prompt_embeds, text_ids, adapter_ca_tokens
+
+    def _load_adapter_weights(self, adapter_dir: str | None) -> None:
+        if not adapter_dir:
+            return
+        adapter_dir = os.path.expanduser(adapter_dir)
+        if not os.path.isdir(adapter_dir):
+            raise FileNotFoundError(f"adapter.load_dir not found: {adapter_dir}")
+
+        def _load_if_exists(module: nn.Module | None, name: str) -> None:
+            if module is None:
+                return
+            path = os.path.join(adapter_dir, name)
+            if not os.path.exists(path):
+                return
+            state = torch.load(path, map_location="cpu")
+            module.load_state_dict(state)
+
+        _load_if_exists(self.prompt_adapter, "prompt_adapter.pt")
+        _load_if_exists(self.text_token_adapter, "text_token_adapter.pt")
+        _load_if_exists(self.thermal_token_adapter, "thermal_query.pt")
+        _load_if_exists(self.thermal_query_generator, "thermal_query.pt")
+        _load_if_exists(self.thermal_gate, "thermal_gate.pt")
 
     def _init_adapters(self):
         cfg = self.adapter_config or {}
@@ -577,24 +674,95 @@ class OminiModel(L.LightningModule):
         self.thermal_adapter_ca_enabled = True
 
     def init_lora(self, lora_path: str, lora_config: dict):
-        assert lora_path or lora_config
-        if lora_path:
-            # TODO: Implement this
-            raise NotImplementedError
-        else:
-            self.transformer.add_adapter(LoraConfig(**lora_config))
-            # TODO: Check if this is correct (p.requires_grad)
-            lora_layers = filter(
-                lambda p: p.requires_grad, self.transformer.parameters()
+        self.lora_adapter_names: list[str] = []
+        self.lora_trainable_adapters: list[str] = []
+        self.lora_active_adapters: list[str] = []
+        self.lora_adapter_scales: dict[str, float] = {}
+        self.lora_save_adapters: list[str] = []
+
+        if not (lora_path or lora_config):
+            return []
+
+        if isinstance(lora_config, dict) and lora_config.get("adapters"):
+            adapters_cfg = lora_config.get("adapters") or []
+            reserved = {"name", "path", "trainable", "scale", "config"}
+            for adapter_cfg in adapters_cfg:
+                name = str(adapter_cfg.get("name", "default"))
+                adapter_lora_cfg = adapter_cfg.get("config") or {
+                    k: v for k, v in adapter_cfg.items() if k not in reserved
+                }
+                if adapter_lora_cfg:
+                    self.transformer.add_adapter(
+                        LoraConfig(**adapter_lora_cfg), adapter_name=name
+                    )
+                if adapter_cfg.get("path"):
+                    self._load_lora_into_adapter(name, adapter_cfg["path"])
+                if bool(adapter_cfg.get("trainable", True)):
+                    self.lora_trainable_adapters.append(name)
+                self.lora_adapter_names.append(name)
+                self.lora_adapter_scales[name] = float(adapter_cfg.get("scale", 1.0))
+
+            self.lora_active_adapters = list(
+                lora_config.get("active") or self.lora_adapter_names
             )
+            self.lora_save_adapters = list(
+                lora_config.get("save_adapters") or self.lora_trainable_adapters
+            )
+            active_scales = [
+                self.lora_adapter_scales.get(name, 1.0)
+                for name in self.lora_active_adapters
+            ]
+            self._set_active_lora_adapters(self.lora_active_adapters, active_scales)
+            return self._collect_lora_params(self.lora_trainable_adapters)
+
+        if lora_path:
+            self._load_lora_into_adapter("default", lora_path)
+            self.lora_adapter_names = ["default"]
+            self.lora_trainable_adapters = ["default"]
+            self.lora_active_adapters = ["default"]
+            self.lora_save_adapters = ["default"]
+            self.lora_adapter_scales["default"] = 1.0
+            return self._collect_lora_params(self.lora_trainable_adapters)
+
+        self.transformer.add_adapter(LoraConfig(**lora_config))
+        self.lora_adapter_names = ["default"]
+        self.lora_trainable_adapters = ["default"]
+        self.lora_active_adapters = ["default"]
+        self.lora_save_adapters = ["default"]
+        self.lora_adapter_scales["default"] = 1.0
+        lora_layers = filter(lambda p: p.requires_grad, self.transformer.parameters())
         return list(lora_layers)
 
     def save_lora(self, path: str):
-        FluxFillPipeline.save_lora_weights(
-            save_directory=path,
-            transformer_lora_layers=get_peft_model_state_dict(self.transformer),
-            safe_serialization=True,
-        )
+        save_adapters = self.lora_save_adapters or ["default"]
+        if len(save_adapters) > 1:
+            for adapter_name in save_adapters:
+                adapter_dir = os.path.join(path, f"lora_{adapter_name}")
+                os.makedirs(adapter_dir, exist_ok=True)
+                try:
+                    state_dict = get_peft_model_state_dict(
+                        self.transformer, adapter_name=adapter_name
+                    )
+                except TypeError:
+                    state_dict = get_peft_model_state_dict(self.transformer)
+                FluxFillPipeline.save_lora_weights(
+                    save_directory=adapter_dir,
+                    transformer_lora_layers=state_dict,
+                    safe_serialization=True,
+                )
+        else:
+            adapter_name = save_adapters[0] if save_adapters else None
+            try:
+                state_dict = get_peft_model_state_dict(
+                    self.transformer, adapter_name=adapter_name
+                )
+            except TypeError:
+                state_dict = get_peft_model_state_dict(self.transformer)
+            FluxFillPipeline.save_lora_weights(
+                save_directory=path,
+                transformer_lora_layers=state_dict,
+                safe_serialization=True,
+            )
         if self.model_config['use_sep']:
             torch.save(self.text_encoder_2.shared, os.path.join(path, "t5_embedding.pth"))
             torch.save(self.text_encoder.text_model.embeddings.token_embedding, os.path.join(path, "clip_embedding.pth"))
@@ -962,10 +1130,10 @@ class OminiModel(L.LightningModule):
             pred_f = pred.float() if loss_dtype == "float32" else pred
             target_f = target.float() if loss_dtype == "float32" else target
             per_token = ((pred_f - target_f) ** 2).mean(dim=-1)
-            loss = (per_token * weights).sum() / (weights.sum() + 1e-8)
+            diff_loss = (per_token * weights).sum() / (weights.sum() + 1e-8)
             if per_example_weight is not None:
                 # weights: [B, T], per_example_weight: [B]
-                loss = loss * per_example_weight.mean()
+                diff_loss = diff_loss * per_example_weight.mean()
             if self.debug_config.get("enabled", False) and (not self._debug_printed_step):
                 masked_frac = float((mask > 0.5).to(dtype=torch.float32).mean().item())
                 self._debug(
@@ -982,9 +1150,72 @@ class OminiModel(L.LightningModule):
             loss_dtype = str(self.loss_config.get("loss_dtype", "float32")).lower()
             pred_f = pred.float() if loss_dtype == "float32" else pred
             target_f = target.float() if loss_dtype == "float32" else target
-            loss = F.mse_loss(pred_f, target_f, reduction="mean")
+            diff_loss = F.mse_loss(pred_f, target_f, reduction="mean")
             if per_example_weight is not None:
-                loss = loss * per_example_weight.mean()
+                diff_loss = diff_loss * per_example_weight.mean()
+
+        diff_weight = float(self.loss_config.get("diff_weight", 1.0))
+        loss = diff_loss * diff_weight
+
+        phys_cfg = self.loss_config.get("phys", {}) or {}
+        if phys_cfg.get("enabled", False):
+            phys_weight = float(phys_cfg.get("weight", 0.1))
+            gray_weight = float(phys_cfg.get("gray_weight", 0.0))
+            grad_weight = float(phys_cfg.get("grad_weight", 0.0))
+            t_weighting = str(phys_cfg.get("t_weighting", "none")).lower()
+            t_power = float(phys_cfg.get("t_power", 1.0))
+
+            t_ = t.view(-1, 1, 1)
+            x0_hat = (x_t - t_ * pred).to(dtype=pred.dtype)
+            vae = self.flux_fill_pipe.vae
+            height = int(imgs.shape[-2])
+            width = int(imgs.shape[-1])
+            latents = self.flux_fill_pipe._unpack_latents(
+                x0_hat, height, width, self.flux_fill_pipe.vae_scale_factor
+            )
+            latents = latents / vae.config.scaling_factor + vae.config.shift_factor
+            pred_img = vae.decode(latents).sample
+            pred_img = (pred_img / 2 + 0.5).clamp(0, 1)
+
+            width = imgs.shape[-1] // 2
+            pred_right = pred_img[..., width:]
+            target_right = imgs[..., width:].to(device=pred_right.device, dtype=pred_right.dtype)
+
+            pred_y = (
+                0.299 * pred_right[:, 0]
+                + 0.587 * pred_right[:, 1]
+                + 0.114 * pred_right[:, 2]
+            )
+            target_y = (
+                0.299 * target_right[:, 0]
+                + 0.587 * target_right[:, 1]
+                + 0.114 * target_right[:, 2]
+            )
+            phys_loss = F.l1_loss(pred_y, target_y, reduction="mean")
+
+            if gray_weight > 0.0:
+                gray_loss = (
+                    (pred_right[:, 0] - pred_right[:, 1]).abs().mean()
+                    + (pred_right[:, 1] - pred_right[:, 2]).abs().mean()
+                )
+                loss = loss + gray_weight * gray_loss
+
+            if grad_weight > 0.0:
+                grad_x_pred = pred_y[:, :, 1:] - pred_y[:, :, :-1]
+                grad_y_pred = pred_y[:, 1:, :] - pred_y[:, :-1, :]
+                grad_x_tgt = target_y[:, :, 1:] - target_y[:, :, :-1]
+                grad_y_tgt = target_y[:, 1:, :] - target_y[:, :-1, :]
+                grad_loss = (
+                    F.l1_loss(grad_x_pred, grad_x_tgt, reduction="mean")
+                    + F.l1_loss(grad_y_pred, grad_y_tgt, reduction="mean")
+                )
+                loss = loss + grad_weight * grad_loss
+
+            if t_weighting == "one_minus_t":
+                t_scale = (1.0 - t).clamp(0, 1).pow(t_power).mean()
+                phys_loss = phys_loss * t_scale
+
+            loss = loss + phys_weight * phys_loss
         self.last_t = t.mean().item()
         if self.debug_config.get("enabled", False) and (not self._debug_printed_step):
             self._debug_printed_step = True

@@ -51,10 +51,19 @@ def init_wandb(wandb_config, run_name):
 def main():
     # Initialize
     is_main_process, rank = get_rank() == 0, get_rank()
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     config = get_config()
     training_config = config["train"]
     run_name = time.strftime("%Y%m%d-%H%M%S")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    num_nodes = int(
+        os.environ.get(
+            "NUM_NODES", str(max(1, world_size // max(local_world_size, 1)))
+        )
+    )
+    is_distributed = world_size > 1
     
     seed = 666
     np.random.seed(seed)
@@ -155,6 +164,14 @@ def main():
         use_offset_noise=config["use_offset_noise"],
     )
 
+    # Initialize lazy modules before DDP wraps the model.
+    try:
+        sample_batch = next(iter(train_loader))
+        with torch.no_grad():
+            _ = trainable_model.training_step(sample_batch, 0)
+    except Exception as e:
+        print(f"[WARN] Lazy module warmup failed on rank {rank}: {e}")
+
     # Callbacks for logging and saving checkpoints
     training_callbacks = (
         [TrainingCallback(run_name, training_config=training_config)]
@@ -163,7 +180,27 @@ def main():
     )
 
     # Initialize trainer
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    devices_cfg = training_config.get("devices", None)
+    if is_distributed:
+        # External launcher (accelerate/torchrun) sets WORLD_SIZE/LOCAL_WORLD_SIZE.
+        devices = local_world_size
+        if devices_cfg not in (None, devices) and is_main_process:
+            print(
+                "[WARN] Distributed launch detected; overriding devices to",
+                devices,
+                "(local_world_size).",
+            )
+        strategy = training_config.get("strategy", "ddp_find_unused_parameters_true")
+    else:
+        devices = devices_cfg if devices_cfg is not None else 1
+        strategy = training_config.get("strategy", "auto")
+
     trainer = L.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
         accumulate_grad_batches=training_config["accumulate_grad_batches"],
         callbacks=training_callbacks,
         enable_checkpointing=False,
