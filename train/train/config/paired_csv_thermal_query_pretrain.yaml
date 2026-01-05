@@ -1,0 +1,79 @@
+flux_path: "/root/autodl-tmp/qyt/hfd_model"
+dtype: "bfloat16"
+
+model:
+  union_cond_attn: true
+  add_cond_attn: false
+  latent_lora: false
+  use_sep: false
+
+train:
+  mode: "thermal_query_pretrain"
+  pretrain:
+    loss: "mse"
+    weight: 1.0
+    normalize: true
+
+  batch_size: 4
+  accumulate_grad_batches: 1
+  dataloader_workers: 4
+  save_interval: 1000
+  sample_interval: 0
+  max_steps: -1
+  gradient_checkpointing: true
+  save_path: "runs_thermal_query_pretrain"
+
+  dataset:
+    type: "paired_csv"
+    base_path: "/root/autodl-tmp/MSRS"
+    metadata_path: "/root/autodl-tmp/MSRS/metadata.csv"
+    source_key: "kontext_images"
+    target_key: "image"
+    prompt_key: "prompt"
+    instruction_text: null
+    caption_key: "prompt"
+    caption_prefix: ""
+    default_caption: ""
+    condition_size: 512
+    target_size: 512
+    drop_text_prob: 0.0
+
+  loss:
+    use_masked_loss: true
+    masked_weight: 1.0
+    unmasked_weight: 0.0
+    sigma_schedule: "flux_shifted_1000"
+    schedule_steps: 1000
+    t_weighting: "flux_gaussian"
+    loss_dtype: "float32"
+
+  adapter:
+    enabled: true
+    trainable: true
+    kind: "none"
+    thermal:
+      enabled: true
+      mode: "image_caption_query"
+      num_tokens: 4
+      query_dim: 256
+      output_dim: 4096
+      query_heads: 8
+      query_layers: 2
+      query_ffn_dim: 1024
+      scale: 1.0
+      init_std: 0.02
+      use_type_embed: true
+      adapter_ca:
+        enabled: false
+
+  debug:
+    enabled: false
+
+  lora_config: null
+
+  optimizer:
+    type: "AdamW"
+    params:
+      lr: 1.0e-4
+      betas: [0.9, 0.999]
+      weight_decay: 0.01

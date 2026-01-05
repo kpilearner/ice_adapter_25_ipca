@@ -309,6 +309,17 @@ def _flatten_image_tokens(tokens: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unexpected image token shape: {tuple(tokens.shape)}")
 
 
+def _pool_tokens(tokens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be > 0")
+    tokens = _flatten_image_tokens(tokens)
+    if tokens.shape[1] == num_tokens:
+        return tokens
+    tokens_t = tokens.transpose(1, 2)
+    pooled = F.adaptive_avg_pool1d(tokens_t, num_tokens)
+    return pooled.transpose(1, 2)
+
+
 class OminiModel(L.LightningModule):
     def __init__(
         self,
@@ -324,6 +335,8 @@ class OminiModel(L.LightningModule):
         debug_config: dict = None,
         gradient_checkpointing: bool = False,
         use_offset_noise: bool = False,
+        train_mode: str = "default",
+        pretrain_config: dict = None,
     ):
         # Initialize the LightningModule
         super().__init__()
@@ -334,6 +347,8 @@ class OminiModel(L.LightningModule):
         self.adapter_config = adapter_config or {}
         self.debug_config = debug_config or {}
         self._debug_printed_step = False
+        self.train_mode = str(train_mode or "default").lower()
+        self.pretrain_config = pretrain_config or {}
         self.adapter_trainable = bool(self.adapter_config.get("trainable", False))
         self.adapter_affect_prompt = bool(self.adapter_config.get("affect_prompt", True))
 
@@ -552,6 +567,19 @@ class OminiModel(L.LightningModule):
             if not os.path.exists(path):
                 return
             state = torch.load(path, map_location="cpu")
+            if isinstance(module, TextTokenAdapter):
+                proj_weight = state.get("proj.weight")
+                if proj_weight is not None:
+                    in_dim = int(proj_weight.shape[1])
+                    out_dim = int(proj_weight.shape[0])
+                    if getattr(module, "pooled_dim", in_dim) != in_dim:
+                        raise ValueError(
+                            "TextTokenAdapter pooled_dim mismatch: "
+                            f"checkpoint={in_dim} module={module.pooled_dim}"
+                        )
+                    if getattr(module, "token_dim", out_dim) != out_dim:
+                        module.proj = nn.Linear(in_dim, out_dim)
+                        module.token_dim = out_dim
             module.load_state_dict(state)
 
         _load_if_exists(self.prompt_adapter, "prompt_adapter.pt")
@@ -734,11 +762,26 @@ class OminiModel(L.LightningModule):
         return list(lora_layers)
 
     def save_lora(self, path: str):
-        save_adapters = self.lora_save_adapters or ["default"]
-        if len(save_adapters) > 1:
-            for adapter_name in save_adapters:
-                adapter_dir = os.path.join(path, f"lora_{adapter_name}")
-                os.makedirs(adapter_dir, exist_ok=True)
+        has_lora = bool(self.lora_adapter_names) or bool(self.lora_layers)
+        if has_lora:
+            save_adapters = self.lora_save_adapters or ["default"]
+            if len(save_adapters) > 1:
+                for adapter_name in save_adapters:
+                    adapter_dir = os.path.join(path, f"lora_{adapter_name}")
+                    os.makedirs(adapter_dir, exist_ok=True)
+                    try:
+                        state_dict = get_peft_model_state_dict(
+                            self.transformer, adapter_name=adapter_name
+                        )
+                    except TypeError:
+                        state_dict = get_peft_model_state_dict(self.transformer)
+                    FluxFillPipeline.save_lora_weights(
+                        save_directory=adapter_dir,
+                        transformer_lora_layers=state_dict,
+                        safe_serialization=True,
+                    )
+            else:
+                adapter_name = save_adapters[0] if save_adapters else None
                 try:
                     state_dict = get_peft_model_state_dict(
                         self.transformer, adapter_name=adapter_name
@@ -746,23 +789,10 @@ class OminiModel(L.LightningModule):
                 except TypeError:
                     state_dict = get_peft_model_state_dict(self.transformer)
                 FluxFillPipeline.save_lora_weights(
-                    save_directory=adapter_dir,
+                    save_directory=path,
                     transformer_lora_layers=state_dict,
                     safe_serialization=True,
                 )
-        else:
-            adapter_name = save_adapters[0] if save_adapters else None
-            try:
-                state_dict = get_peft_model_state_dict(
-                    self.transformer, adapter_name=adapter_name
-                )
-            except TypeError:
-                state_dict = get_peft_model_state_dict(self.transformer)
-            FluxFillPipeline.save_lora_weights(
-                save_directory=path,
-                transformer_lora_layers=state_dict,
-                safe_serialization=True,
-            )
         if self.model_config['use_sep']:
             torch.save(self.text_encoder_2.shared, os.path.join(path, "t5_embedding.pth"))
             torch.save(self.text_encoder.text_model.embeddings.token_embedding, os.path.join(path, "clip_embedding.pth"))
@@ -866,22 +896,29 @@ class OminiModel(L.LightningModule):
         self.transformer.requires_grad_(False)
         opt_config = self.optimizer_config
 
-        # Set the trainable parameters
-        self.trainable_params = list(self.lora_layers)
-        if self.adapter_trainable:
-            if self.prompt_adapter is not None:
-                self.trainable_params += list(self.prompt_adapter.parameters())
-            if self.text_token_adapter is not None:
-                self.trainable_params += list(self.text_token_adapter.parameters())
-            if self.thermal_token_adapter is not None:
-                self.trainable_params += list(self.thermal_token_adapter.parameters())
-            if self.thermal_query_generator is not None:
-                self.trainable_params += list(self.thermal_query_generator.parameters())
-            if self.adapter_ca_layers:
-                for layer in self.adapter_ca_layers:
-                    self.trainable_params += list(layer.parameters())
-            if self.thermal_gate is not None:
+        if self.train_mode == "thermal_query_pretrain":
+            if self.thermal_query_generator is None:
+                raise ValueError("thermal_query_pretrain requires thermal_query_generator to be enabled.")
+            self.trainable_params = list(self.thermal_query_generator.parameters())
+            if self.pretrain_config.get("train_gate", False) and self.thermal_gate is not None:
                 self.trainable_params += list(self.thermal_gate.parameters())
+        else:
+            # Set the trainable parameters
+            self.trainable_params = list(self.lora_layers)
+            if self.adapter_trainable:
+                if self.prompt_adapter is not None:
+                    self.trainable_params += list(self.prompt_adapter.parameters())
+                if self.text_token_adapter is not None:
+                    self.trainable_params += list(self.text_token_adapter.parameters())
+                if self.thermal_token_adapter is not None:
+                    self.trainable_params += list(self.thermal_token_adapter.parameters())
+                if self.thermal_query_generator is not None:
+                    self.trainable_params += list(self.thermal_query_generator.parameters())
+                if self.adapter_ca_layers:
+                    for layer in self.adapter_ca_layers:
+                        self.trainable_params += list(layer.parameters())
+                if self.thermal_gate is not None:
+                    self.trainable_params += list(self.thermal_gate.parameters())
 
         # Unfreeze trainable parameters
         for p in self.trainable_params:
@@ -945,7 +982,66 @@ class OminiModel(L.LightningModule):
         )
         return step_loss
 
+    def _thermal_query_pretrain_loss(self, batch: dict) -> torch.Tensor:
+        if self.thermal_query_generator is None:
+            raise ValueError("thermal_query_pretrain requires thermal_query_generator to be enabled.")
+
+        imgs = batch["image"]
+        prompts = batch["description"]
+        captions = batch.get("caption")
+
+        with torch.no_grad():
+            prompt_embeds, _, _ = prepare_text_input(self.flux_fill_pipe, prompts)
+            caption_prompt_embeds = None
+            if captions is not None:
+                caption_prompt_embeds, _, _ = prepare_text_input(self.flux_fill_pipe, captions)
+
+            width = int(imgs.shape[-1] // 2)
+            vis = imgs[..., :width]
+            ir = imgs[..., width:]
+
+            vis_tokens, _ = encode_images(self.flux_fill_pipe, vis)
+            ir_tokens, _ = encode_images(self.flux_fill_pipe, ir)
+
+            thermal_image_tokens = _flatten_image_tokens(vis_tokens).to(
+                device=prompt_embeds.device, dtype=prompt_embeds.dtype
+            )
+            target_tokens = _pool_tokens(ir_tokens, self.thermal_query_generator.num_queries).to(
+                device=prompt_embeds.device, dtype=prompt_embeds.dtype
+            )
+
+            thermal_caption_tokens = caption_prompt_embeds if caption_prompt_embeds is not None else prompt_embeds
+
+        self.thermal_query_generator.ensure_output_dim(
+            int(target_tokens.shape[-1]),
+            device=thermal_image_tokens.device,
+            dtype=thermal_image_tokens.dtype,
+        )
+        pred_tokens = self.thermal_query_generator(
+            image_tokens=thermal_image_tokens,
+            caption_tokens=thermal_caption_tokens,
+        )
+
+        if bool(self.pretrain_config.get("normalize", True)):
+            pred_tokens = F.normalize(pred_tokens, dim=-1)
+            target_tokens = F.normalize(target_tokens, dim=-1)
+
+        loss_type = str(self.pretrain_config.get("loss", "mse")).lower()
+        if loss_type == "l1":
+            loss = F.l1_loss(pred_tokens, target_tokens)
+        elif loss_type == "cosine":
+            loss = 1.0 - F.cosine_similarity(pred_tokens, target_tokens, dim=-1).mean()
+        else:
+            loss = F.mse_loss(pred_tokens, target_tokens)
+
+        weight = float(self.pretrain_config.get("weight", 1.0))
+        self.last_t = 0.0
+        return loss * weight
+
     def step(self, batch):
+        if self.train_mode == "thermal_query_pretrain":
+            return self._thermal_query_pretrain_loss(batch)
+
         imgs = batch["image"]
         mask_imgs = batch["condition"]
         condition_types = batch["condition_type"]

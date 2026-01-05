@@ -162,6 +162,8 @@ def main():
         model_config=config.get("model", {}),
         gradient_checkpointing=training_config.get("gradient_checkpointing", False),
         use_offset_noise=config["use_offset_noise"],
+        train_mode=training_config.get("mode", "default"),
+        pretrain_config=training_config.get("pretrain", None),
     )
 
     # Initialize lazy modules before DDP wraps the model.
