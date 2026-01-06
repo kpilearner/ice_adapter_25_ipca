@@ -11,6 +11,9 @@ class AdapterCrossAttention(torch.nn.Module):
         heads: int,
         scale_init: float = 0.0,
         trainable_scale: bool = True,
+        gate_mode: str | None = None,
+        gate_hidden_dim: int = 0,
+        gate_init_bias: float = 0.0,
     ):
         super().__init__()
         if dim % heads != 0:
@@ -18,6 +21,9 @@ class AdapterCrossAttention(torch.nn.Module):
         self.dim = int(dim)
         self.heads = int(heads)
         self.head_dim = self.dim // self.heads
+        self.gate_mode = str(gate_mode).lower() if gate_mode else "none"
+        self.gate_hidden_dim = int(gate_hidden_dim)
+        self.gate_init_bias = float(gate_init_bias)
         if trainable_scale:
             self.scale = torch.nn.Parameter(torch.tensor(float(scale_init)))
         else:
@@ -28,6 +34,19 @@ class AdapterCrossAttention(torch.nn.Module):
         self.to_v = torch.nn.Linear(self.dim, self.dim, bias=False)
         self.to_out = torch.nn.Linear(self.dim, self.dim, bias=False)
         self.kv_proj = torch.nn.LazyLinear(self.dim)
+        self.gate_proj = None
+        if self.gate_mode in ("headwise", "elementwise"):
+            gate_out_dim = self.heads if self.gate_mode == "headwise" else self.dim
+            if self.gate_hidden_dim > 0:
+                self.gate_proj = torch.nn.Sequential(
+                    torch.nn.Linear(self.dim, self.gate_hidden_dim),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.gate_hidden_dim, gate_out_dim),
+                )
+                self.gate_proj[-1].bias.data.fill_(self.gate_init_bias)
+            else:
+                self.gate_proj = torch.nn.Linear(self.dim, gate_out_dim)
+                self.gate_proj.bias.data.fill_(self.gate_init_bias)
 
     def forward(self, hidden_states: torch.Tensor, adapter_tokens: torch.Tensor) -> torch.Tensor:
         if adapter_tokens is None:
@@ -47,6 +66,14 @@ class AdapterCrossAttention(torch.nn.Module):
 
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(bsz, -1, self.dim)
+        if self.gate_proj is not None:
+            gate = torch.sigmoid(self.gate_proj(hidden_states))
+            if self.gate_mode == "headwise":
+                out = out.view(bsz, -1, self.heads, self.head_dim)
+                out = out * gate.view(bsz, -1, self.heads, 1)
+                out = out.view(bsz, -1, self.dim)
+            else:
+                out = out * gate
         out = self.to_out(out)
         return out * self.scale
 

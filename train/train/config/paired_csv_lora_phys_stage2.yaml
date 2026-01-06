@@ -40,14 +40,17 @@ train:
     schedule_steps: 1000
     t_weighting: "flux_gaussian"
     loss_dtype: "float32"
-    diff_weight: 0.2
-    phys:
-      enabled: true
-      weight: 0.1
-      gray_weight: 0.02
-      grad_weight: 0.05
-      t_weighting: "one_minus_t"
-      t_power: 1.0
+    diff_weight: 0.0
+    image_loss:
+      l1_weight: 1.0
+      ssim_weight: 0.2
+      perceptual_weight: 0.1
+      l1_on_gray: true
+      ssim_on_gray: true
+      ssim_window: 11
+      ssim_sigma: 1.5
+      perceptual_layers: [4, 9, 16]
+      perceptual_pretrained: true
 
   adapter:
     enabled: true

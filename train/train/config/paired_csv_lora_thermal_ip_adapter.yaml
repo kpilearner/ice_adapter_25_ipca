@@ -44,27 +44,25 @@ train:
   adapter:
     enabled: true
     trainable: true
+    affect_prompt: false
     kind: "tokens"
+    tokens_to_ca: true
     pooled_dim: 768
     num_tokens: 8
     token_hidden_dim: 1536
     scale: 1.0
     thermal:
-      enabled: true
-      mode: "image_caption_query"
-      num_tokens: 4
-      query_dim: 256
-      query_heads: 8
-      query_layers: 2
-      query_ffn_dim: 1024
-      scale: 1.0
-      init_std: 0.02
-      use_type_embed: true
+      enabled: false
       adapter_ca:
         enabled: true
         scale: 0.0
         trainable_scale: true
         concat_to_text: false
+        gate:
+          enabled: true
+          mode: "headwise"
+          hidden_dim: 0
+          init_bias: 0.0
 
   debug:
     enabled: false

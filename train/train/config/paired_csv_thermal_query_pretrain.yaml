@@ -29,11 +29,13 @@ train:
     metadata_path: "/root/autodl-tmp/MSRS/metadata.csv"
     source_key: "kontext_images"
     target_key: "image"
-    prompt_key: "prompt"
-    instruction_text: null
+    prompt_key: ""
+    instruction_text: ""
     caption_key: "prompt"
     caption_prefix: ""
     default_caption: ""
+    default_prompt: ""
+    prompt_prefix: ""
     condition_size: 512
     target_size: 512
     drop_text_prob: 0.0
@@ -56,7 +58,7 @@ train:
       mode: "image_caption_query"
       num_tokens: 4
       query_dim: 256
-      output_dim: 4096
+      output_dim: 64
       query_heads: 8
       query_layers: 2
       query_ffn_dim: 1024

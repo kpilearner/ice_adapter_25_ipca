@@ -399,6 +399,11 @@ def _patch_transformer_forward(transformer, model_config):
 def _init_adapter_ca(transformer, state_list, ca_cfg):
     scale_init = float(ca_cfg.get("scale", 0.0))
     trainable_scale = bool(ca_cfg.get("trainable_scale", True))
+    gate_cfg = ca_cfg.get("gate", {}) or {}
+    gate_enabled = bool(gate_cfg.get("enabled", False))
+    gate_mode = str(gate_cfg.get("mode", "headwise")).lower()
+    gate_hidden_dim = int(gate_cfg.get("hidden_dim", 0))
+    gate_init_bias = float(gate_cfg.get("init_bias", 0.0))
     modules = []
     for idx, block in enumerate(transformer.transformer_blocks):
         dim = int(getattr(block.attn.to_q, "in_features", block.attn.to_q.weight.shape[1]))
@@ -408,11 +413,14 @@ def _init_adapter_ca(transformer, state_list, ca_cfg):
             heads=heads,
             scale_init=scale_init,
             trainable_scale=trainable_scale,
+            gate_mode=gate_mode if gate_enabled else None,
+            gate_hidden_dim=gate_hidden_dim,
+            gate_init_bias=gate_init_bias,
         )
         ref_weight = block.attn.to_q.weight
         block.adapter_ca.to(device=ref_weight.device, dtype=ref_weight.dtype)
         if isinstance(state_list, list) and idx < len(state_list):
-            block.adapter_ca.load_state_dict(state_list[idx])
+            block.adapter_ca.load_state_dict(state_list[idx], strict=False)
         modules.append(block.adapter_ca)
     return modules
 
@@ -594,6 +602,7 @@ def _load_adapters(adapter_dir: str, debug: bool):
     if debug:
         print("[DEBUG][csv] adapter_cfg:", adapter_cfg)
     adapter_affect_prompt = bool(adapter_cfg.get("affect_prompt", True))
+    adapter_tokens_to_ca = bool(adapter_cfg.get("tokens_to_ca", False))
 
     prompt_adapter_path = os.path.join(adapter_dir, "prompt_adapter.pt")
     token_adapter_path = os.path.join(adapter_dir, "text_token_adapter.pt")
@@ -749,6 +758,7 @@ def _load_adapters(adapter_dir: str, debug: bool):
         thermal_gate,
         thermal_gate_balance_text,
         adapter_affect_prompt,
+        adapter_tokens_to_ca,
     )
 
 
@@ -860,6 +870,7 @@ def main() -> int:
     thermal_gate = None
     thermal_gate_balance_text = False
     adapter_affect_prompt = True
+    adapter_tokens_to_ca = False
     current_thermal_image_tokens = None
     current_adapter_token_mask = None
     if args.adapter_dir is not None:
@@ -871,6 +882,7 @@ def main() -> int:
             thermal_gate,
             thermal_gate_balance_text,
             adapter_affect_prompt,
+            adapter_tokens_to_ca,
         ) = _load_adapters(args.adapter_dir, debug=args.debug_adapter)
         if (
             prompt_adapter is not None
@@ -917,11 +929,12 @@ def main() -> int:
                 thermal_tokens = None
                 if thermal_query_generator is not None:
                     _ensure_module_on(thermal_query_generator, adapter_pooled)
-                    thermal_query_generator.ensure_output_dim(
-                        int(prompt_embeds.shape[-1]),
-                        device=adapter_pooled.device,
-                        dtype=adapter_pooled.dtype,
-                    )
+                    if not adapter_ca_enabled or adapter_ca_concat:
+                        thermal_query_generator.ensure_output_dim(
+                            int(prompt_embeds.shape[-1]),
+                            device=adapter_pooled.device,
+                            dtype=adapter_pooled.dtype,
+                        )
                     image_tokens = current_thermal_image_tokens
                     if image_tokens is not None:
                         image_tokens = image_tokens.to(
@@ -939,6 +952,7 @@ def main() -> int:
                         device=adapter_pooled.device,
                         dtype=adapter_pooled.dtype,
                     )
+                adapter_ca_tokens = None
                 if thermal_tokens is not None:
                     if gate is not None:
                         thermal_tokens = _apply_gate(
@@ -948,26 +962,12 @@ def main() -> int:
                             thermal_gate.heads,
                         )
                     if adapter_ca_enabled:
-                        pipe.transformer._adapter_tokens = thermal_tokens.to(
-                            device=prompt_embeds.device, dtype=prompt_embeds.dtype
-                        )
-                        if current_adapter_token_mask is not None:
-                            pipe.transformer._adapter_token_mask = current_adapter_token_mask.to(
-                                device=prompt_embeds.device, dtype=prompt_embeds.dtype
-                            )
-                        else:
-                            pipe.transformer._adapter_token_mask = None
-                    else:
-                        pipe.transformer._adapter_tokens = None
-                        pipe.transformer._adapter_token_mask = None
+                        adapter_ca_tokens = thermal_tokens
                     if not adapter_ca_enabled or adapter_ca_concat:
                         prompt_embeds = torch.cat(
                             [prompt_embeds, thermal_tokens.to(dtype=prompt_embeds.dtype)], dim=1
                         )
                         text_ids = _extend_txt_ids(text_ids, thermal_tokens.shape[1])
-                elif adapter_ca_enabled:
-                    pipe.transformer._adapter_tokens = None
-                    pipe.transformer._adapter_token_mask = None
 
                 if token_adapter is not None:
                     _ensure_module_on(token_adapter, adapter_pooled)
@@ -979,8 +979,28 @@ def main() -> int:
                             thermal_gate.mode,
                             thermal_gate.heads,
                         )
-                    prompt_embeds = torch.cat([prompt_embeds, tokens], dim=1)
-                    text_ids = _extend_txt_ids(text_ids, tokens.shape[1])
+                    if adapter_tokens_to_ca and adapter_ca_enabled:
+                        if adapter_ca_tokens is None:
+                            adapter_ca_tokens = tokens
+                        else:
+                            adapter_ca_tokens = torch.cat([adapter_ca_tokens, tokens], dim=1)
+                    else:
+                        prompt_embeds = torch.cat([prompt_embeds, tokens], dim=1)
+                        text_ids = _extend_txt_ids(text_ids, tokens.shape[1])
+                if adapter_ca_enabled:
+                    if adapter_ca_tokens is not None:
+                        pipe.transformer._adapter_tokens = adapter_ca_tokens.to(
+                            device=prompt_embeds.device, dtype=prompt_embeds.dtype
+                        )
+                        if current_adapter_token_mask is not None:
+                            pipe.transformer._adapter_token_mask = current_adapter_token_mask.to(
+                                device=prompt_embeds.device, dtype=prompt_embeds.dtype
+                            )
+                        else:
+                            pipe.transformer._adapter_token_mask = None
+                    else:
+                        pipe.transformer._adapter_tokens = None
+                        pipe.transformer._adapter_token_mask = None
 
                 return prompt_embeds, pooled_prompt_embeds, text_ids
 

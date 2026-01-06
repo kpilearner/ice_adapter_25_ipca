@@ -32,6 +32,7 @@ train:
     drop_text_prob: 0.0
 
   loss:
+    diff_weight: 0.0
     use_masked_loss: true
     masked_weight: 1.0
     unmasked_weight: 0.0
@@ -39,6 +40,16 @@ train:
     schedule_steps: 1000
     t_weighting: "flux_gaussian"
     loss_dtype: "float32"
+    image_loss:
+      l1_weight: 1.0
+      ssim_weight: 0.2
+      perceptual_weight: 0.1
+      l1_on_gray: true
+      ssim_on_gray: true
+      ssim_window: 11
+      ssim_sigma: 1.5
+      perceptual_layers: [4, 9, 16]
+      perceptual_pretrained: true
 
   adapter:
     enabled: true
@@ -56,7 +67,7 @@ train:
       mode: "image_caption_query"
       num_tokens: 4
       query_dim: 256
-      output_dim: 4096
+      output_dim: 64
       query_heads: 8
       query_layers: 2
       query_ffn_dim: 1024

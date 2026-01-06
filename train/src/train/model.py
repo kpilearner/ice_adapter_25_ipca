@@ -14,6 +14,13 @@ try:
 except Exception:  # pragma: no cover - optional PEFT API
     set_peft_model_state_dict = None
 
+try:
+    from torchvision import models as tv_models
+    from torchvision.models import VGG16_Weights
+except Exception:  # pragma: no cover - optional torchvision
+    tv_models = None
+    VGG16_Weights = None
+
 from ..flux.transformer import tranformer_forward
 from ..flux.block import AdapterCrossAttention
 from ..flux.condition import Condition
@@ -256,6 +263,127 @@ class ThermalQueryGenerator(nn.Module):
         return self.scale * query
 
 
+_SSIM_WINDOW_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(
+        self,
+        layer_ids: list[int] | None = None,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        if tv_models is None:
+            raise RuntimeError("torchvision is required for perceptual loss but is not available.")
+        if layer_ids is None:
+            layer_ids = [4, 9, 16]
+        self.layer_ids = sorted({int(idx) for idx in layer_ids})
+        weights = None
+        if pretrained and VGG16_Weights is not None:
+            weights = VGG16_Weights.DEFAULT
+        self.vgg = tv_models.vgg16(weights=weights).features
+        self.vgg.eval()
+        for param in self.vgg.parameters():
+            param.requires_grad_(False)
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def _prep(self, img: torch.Tensor) -> torch.Tensor:
+        if img.shape[1] == 1:
+            img = img.repeat(1, 3, 1, 1)
+        img = img.clamp(0, 1)
+        return (img - self.mean) / self.std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        x = self._prep(pred)
+        y = self._prep(target)
+        loss = 0.0
+        layer_ids = self.layer_ids
+        next_idx = 0
+        for idx, layer in enumerate(self.vgg):
+            x = layer(x)
+            y = layer(y)
+            if next_idx < len(layer_ids) and idx == layer_ids[next_idx]:
+                loss = loss + F.l1_loss(x, y, reduction="mean")
+                next_idx += 1
+                if next_idx >= len(layer_ids):
+                    break
+        return loss
+
+
+def _rgb_to_gray(img: torch.Tensor) -> torch.Tensor:
+    if img.shape[1] == 1:
+        return img
+    return (
+        0.299 * img[:, 0:1]
+        + 0.587 * img[:, 1:2]
+        + 0.114 * img[:, 2:3]
+    )
+
+
+def _get_ssim_window(
+    window_size: int,
+    sigma: float,
+    channels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (window_size, float(sigma), channels, device.type, device.index, str(dtype))
+    cached = _SSIM_WINDOW_CACHE.get(key)
+    if cached is not None:
+        return cached
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
+    g = g / g.sum()
+    window_2d = g[:, None] * g[None, :]
+    window = window_2d.view(1, 1, window_size, window_size).repeat(channels, 1, 1, 1)
+    _SSIM_WINDOW_CACHE[key] = window
+    return window
+
+
+def _ssim(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 11,
+    sigma: float = 1.5,
+    data_range: float = 1.0,
+    k1: float = 0.01,
+    k2: float = 0.03,
+) -> torch.Tensor:
+    if pred.shape != target.shape:
+        raise ValueError("SSIM inputs must have the same shape.")
+    channels = pred.shape[1]
+    window = _get_ssim_window(
+        window_size,
+        sigma,
+        channels,
+        device=pred.device,
+        dtype=pred.dtype,
+    )
+    padding = window_size // 2
+    mu1 = F.conv2d(pred, window, padding=padding, groups=channels)
+    mu2 = F.conv2d(target, window, padding=padding, groups=channels)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = F.conv2d(pred * pred, window, padding=padding, groups=channels) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, window, padding=padding, groups=channels) - mu2_sq
+    sigma12 = F.conv2d(pred * target, window, padding=padding, groups=channels) - mu1_mu2
+
+    c1 = (k1 * data_range) ** 2
+    c2 = (k2 * data_range) ** 2
+    ssim_map = ((2.0 * mu1_mu2 + c1) * (2.0 * sigma12 + c2)) / (
+        (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    )
+    return ssim_map.mean()
+
+
 def _apply_gate(tokens: torch.Tensor, gate: torch.Tensor, mode: str, heads: int) -> torch.Tensor:
     if tokens is None:
         return tokens
@@ -351,6 +479,7 @@ class OminiModel(L.LightningModule):
         self.pretrain_config = pretrain_config or {}
         self.adapter_trainable = bool(self.adapter_config.get("trainable", False))
         self.adapter_affect_prompt = bool(self.adapter_config.get("affect_prompt", True))
+        self.adapter_tokens_to_ca = bool(self.adapter_config.get("tokens_to_ca", False))
 
         # Load the Flux pipeline
         self.flux_fill_pipe = FluxFillPipeline.from_pretrained(flux_fill_id).to(dtype=dtype).to(device)
@@ -387,7 +516,19 @@ class OminiModel(L.LightningModule):
         self.thermal_adapter_ca_concat = False
         self._init_adapter_ca()
 
+        self.image_loss_cfg = self.loss_config.get("image_loss", {}) or {}
+        perceptual_weight = float(self.image_loss_cfg.get("perceptual_weight", 0.0))
+        self.perceptual_loss = None
+        if perceptual_weight > 0.0:
+            if tv_models is None:
+                raise RuntimeError("perceptual_weight > 0 requires torchvision to be installed.")
+            layer_ids = self.image_loss_cfg.get("perceptual_layers", [4, 9, 16])
+            pretrained = bool(self.image_loss_cfg.get("perceptual_pretrained", True))
+            self.perceptual_loss = VGGPerceptualLoss(layer_ids=layer_ids, pretrained=pretrained)
+
         self.to(device).to(dtype)
+        if self.perceptual_loss is not None:
+            self.perceptual_loss.to(device=device, dtype=torch.float32)
 
     def _debug(self, *args):
         if not self.debug_config.get("enabled", False):
@@ -540,15 +681,25 @@ class OminiModel(L.LightningModule):
                     self.thermal_gate.mode,
                     self.thermal_gate.heads,
                 )
-            prompt_embeds = torch.cat([prompt_embeds, adapter_tokens.to(dtype=prompt_embeds.dtype)], dim=1)
-            text_ids = _extend_txt_ids(text_ids, adapter_tokens.shape[1])
+            append_to_prompt = not (self.adapter_tokens_to_ca and self.thermal_adapter_ca_enabled)
+            if not append_to_prompt:
+                if adapter_ca_tokens is None:
+                    adapter_ca_tokens = adapter_tokens
+                else:
+                    adapter_ca_tokens = torch.cat([adapter_ca_tokens, adapter_tokens], dim=1)
+            else:
+                prompt_embeds = torch.cat([prompt_embeds, adapter_tokens.to(dtype=prompt_embeds.dtype)], dim=1)
+                text_ids = _extend_txt_ids(text_ids, adapter_tokens.shape[1])
             if self.debug_config.get("enabled", False) and (not self._debug_printed_step):
-                new_txt_ids_len = int(text_ids.shape[1] if text_ids.ndim == 3 else text_ids.shape[0])
                 self._debug(
-                    "token_adapter injected",
+                    "token_adapter",
                     "adapter_tokens.shape=", tuple(adapter_tokens.shape),
+                    "to_ca=", not append_to_prompt,
                     "prompt_embeds_len", orig_prompt_len, "->", int(prompt_embeds.shape[1]),
-                    "txt_ids_len", orig_txt_ids_len, "->", new_txt_ids_len,
+                    "txt_ids_len",
+                    orig_txt_ids_len,
+                    "->",
+                    int(text_ids.shape[1] if text_ids.ndim == 3 else text_ids.shape[0]),
                 )
 
         return prompt_embeds, pooled_prompt_embeds, text_ids, adapter_ca_tokens
@@ -688,6 +839,11 @@ class OminiModel(L.LightningModule):
             return
         scale_init = float(ca_cfg.get("scale", 0.0))
         trainable_scale = bool(ca_cfg.get("trainable_scale", True))
+        gate_cfg = ca_cfg.get("gate", {}) or {}
+        gate_enabled = bool(gate_cfg.get("enabled", False))
+        gate_mode = str(gate_cfg.get("mode", "headwise")).lower()
+        gate_hidden_dim = int(gate_cfg.get("hidden_dim", 0))
+        gate_init_bias = float(gate_cfg.get("init_bias", 0.0))
         self.thermal_adapter_ca_concat = bool(ca_cfg.get("concat_to_text", False))
         for block in self.transformer.transformer_blocks:
             dim = int(getattr(block.attn.to_q, "in_features", block.attn.to_q.weight.shape[1]))
@@ -697,6 +853,9 @@ class OminiModel(L.LightningModule):
                 heads=heads,
                 scale_init=scale_init,
                 trainable_scale=trainable_scale,
+                gate_mode=gate_mode if gate_enabled else None,
+                gate_hidden_dim=gate_hidden_dim,
+                gate_init_bias=gate_init_bias,
             )
             self.adapter_ca_layers.append(block.adapter_ca)
         self.thermal_adapter_ca_enabled = True
@@ -824,6 +983,7 @@ class OminiModel(L.LightningModule):
             resolved = dict(self.adapter_config or {})
             resolved.setdefault("enabled", True)
             resolved.setdefault("model", dict(self.model_config or {}))
+            resolved["tokens_to_ca"] = bool(self.adapter_tokens_to_ca)
             if self.prompt_adapter is not None:
                 # infer dims from module weights (robust to config mismatches)
                 resolved.setdefault("kind", "pooled")
@@ -861,14 +1021,26 @@ class OminiModel(L.LightningModule):
                 thermal_resolved["scale"] = float(getattr(self.thermal_query_generator, "scale", 1.0))
                 thermal_resolved["init_std"] = float(getattr(self.thermal_query_generator, "init_std", 0.02))
                 thermal_resolved["use_type_embed"] = bool(getattr(self.thermal_query_generator, "use_type_embed", True))
-                if self.thermal_adapter_ca_enabled:
-                    scale_param = self.adapter_ca_layers[0].scale if self.adapter_ca_layers else None
-                    trainable_scale = bool(isinstance(scale_param, torch.nn.Parameter)) if scale_param is not None else True
-                    thermal_resolved["adapter_ca"] = {
-                        "enabled": True,
-                        "concat_to_text": bool(self.thermal_adapter_ca_concat),
-                        "trainable_scale": trainable_scale,
-                    }
+                resolved["thermal"] = thermal_resolved
+            if self.thermal_adapter_ca_enabled:
+                thermal_resolved = dict(resolved.get("thermal", {}) or {})
+                ca_resolved = dict(thermal_resolved.get("adapter_ca", {}) or {})
+                scale_param = self.adapter_ca_layers[0].scale if self.adapter_ca_layers else None
+                trainable_scale = bool(isinstance(scale_param, torch.nn.Parameter)) if scale_param is not None else True
+                ca_resolved["enabled"] = True
+                ca_resolved["concat_to_text"] = bool(self.thermal_adapter_ca_concat)
+                ca_resolved["trainable_scale"] = trainable_scale
+                if self.adapter_ca_layers:
+                    ca_layer = self.adapter_ca_layers[0]
+                    gate_mode = getattr(ca_layer, "gate_mode", "none")
+                    if gate_mode and gate_mode != "none":
+                        gate_resolved = dict(ca_resolved.get("gate", {}) or {})
+                        gate_resolved["enabled"] = True
+                        gate_resolved["mode"] = str(gate_mode)
+                        gate_resolved["hidden_dim"] = int(getattr(ca_layer, "gate_hidden_dim", 0))
+                        gate_resolved["init_bias"] = float(getattr(ca_layer, "gate_init_bias", 0.0))
+                        ca_resolved["gate"] = gate_resolved
+                thermal_resolved["adapter_ca"] = ca_resolved
                 resolved["thermal"] = thermal_resolved
             if self.thermal_gate is not None:
                 thermal_resolved = dict(resolved.get("thermal", {}) or {})
@@ -1253,14 +1425,18 @@ class OminiModel(L.LightningModule):
         diff_weight = float(self.loss_config.get("diff_weight", 1.0))
         loss = diff_loss * diff_weight
 
-        phys_cfg = self.loss_config.get("phys", {}) or {}
-        if phys_cfg.get("enabled", False):
-            phys_weight = float(phys_cfg.get("weight", 0.1))
-            gray_weight = float(phys_cfg.get("gray_weight", 0.0))
-            grad_weight = float(phys_cfg.get("grad_weight", 0.0))
-            t_weighting = str(phys_cfg.get("t_weighting", "none")).lower()
-            t_power = float(phys_cfg.get("t_power", 1.0))
+        image_loss_cfg = self.image_loss_cfg
+        l1_weight = float(image_loss_cfg.get("l1_weight", 0.0))
+        ssim_weight = float(image_loss_cfg.get("ssim_weight", 0.0))
+        perceptual_weight = float(image_loss_cfg.get("perceptual_weight", 0.0))
+        use_image_loss = (l1_weight > 0.0) or (ssim_weight > 0.0) or (perceptual_weight > 0.0)
 
+        phys_cfg = self.loss_config.get("phys", {}) or {}
+        phys_enabled = bool(phys_cfg.get("enabled", False))
+
+        pred_right = None
+        target_right = None
+        if use_image_loss or phys_enabled:
             t_ = t.view(-1, 1, 1)
             x0_hat = (x_t - t_ * pred).to(dtype=pred.dtype)
             vae = self.flux_fill_pipe.vae
@@ -1277,16 +1453,52 @@ class OminiModel(L.LightningModule):
             pred_right = pred_img[..., width:]
             target_right = imgs[..., width:].to(device=pred_right.device, dtype=pred_right.dtype)
 
-            pred_y = (
-                0.299 * pred_right[:, 0]
-                + 0.587 * pred_right[:, 1]
-                + 0.114 * pred_right[:, 2]
-            )
-            target_y = (
-                0.299 * target_right[:, 0]
-                + 0.587 * target_right[:, 1]
-                + 0.114 * target_right[:, 2]
-            )
+        if use_image_loss:
+            pred_img_f = pred_right.float()
+            target_img_f = target_right.float()
+
+            if l1_weight > 0.0:
+                if bool(image_loss_cfg.get("l1_on_gray", True)):
+                    pred_l1 = _rgb_to_gray(pred_img_f)
+                    target_l1 = _rgb_to_gray(target_img_f)
+                else:
+                    pred_l1 = pred_img_f
+                    target_l1 = target_img_f
+                l1_loss = F.l1_loss(pred_l1, target_l1, reduction="mean")
+                loss = loss + l1_weight * l1_loss
+
+            if ssim_weight > 0.0:
+                if bool(image_loss_cfg.get("ssim_on_gray", True)):
+                    pred_ssim = _rgb_to_gray(pred_img_f)
+                    target_ssim = _rgb_to_gray(target_img_f)
+                else:
+                    pred_ssim = pred_img_f
+                    target_ssim = target_img_f
+                window_size = int(image_loss_cfg.get("ssim_window", 11))
+                sigma = float(image_loss_cfg.get("ssim_sigma", 1.5))
+                ssim_value = _ssim(
+                    pred_ssim,
+                    target_ssim,
+                    window_size=window_size,
+                    sigma=sigma,
+                    data_range=1.0,
+                )
+                loss = loss + ssim_weight * (1.0 - ssim_value)
+
+            if perceptual_weight > 0.0:
+                if self.perceptual_loss is None:
+                    raise RuntimeError("perceptual_weight > 0 but perceptual_loss is not initialized.")
+                loss = loss + perceptual_weight * self.perceptual_loss(pred_img_f, target_img_f)
+
+        if phys_enabled:
+            phys_weight = float(phys_cfg.get("weight", 0.1))
+            gray_weight = float(phys_cfg.get("gray_weight", 0.0))
+            grad_weight = float(phys_cfg.get("grad_weight", 0.0))
+            t_weighting = str(phys_cfg.get("t_weighting", "none")).lower()
+            t_power = float(phys_cfg.get("t_power", 1.0))
+
+            pred_y = _rgb_to_gray(pred_right).squeeze(1)
+            target_y = _rgb_to_gray(target_right).squeeze(1)
             phys_loss = F.l1_loss(pred_y, target_y, reduction="mean")
 
             if gray_weight > 0.0:
